@@ -21,7 +21,7 @@ if(fs.existsSync(prefix)){try{run(process.execPath,[validatorFile,'installed',pr
 const work=fs.mkdtempSync(path.join(base,'.work','install.')); fs.chmodSync(work,0o700); fs.writeFileSync(path.join(work,'install.log'),'started '+new Date().toISOString()+'\n',{mode:0o600});
 try{
  const downloads=path.join(work,'assets');fs.mkdirSync(downloads,{mode:0o700});
- const proto=process.env.AB_FIXTURE_TEST==='1'?'=file,https':'=https';for(const [name,a] of Object.entries(manifest.assets)){const out=path.join(downloads,name);run('curl',['--fail','--location','--proto',proto,'--connect-timeout','10','--max-time','120','--output',out,new URL(a.path,manifest.asset_base).href]);if(sha(out)!==a.sha256)throw Error(`asset hash mismatch: ${name}`)}
+ const proto=process.env.AB_FIXTURE_TEST==='1'?(process.env.AB_TEST_HTTP==='1'?'=file,http,https':'=file,https'):'=https';for(const [name,a] of Object.entries(manifest.assets)){const out=path.join(downloads,name);run('curl',['--fail','--location','--proto',proto,'--connect-timeout','10','--max-time','120','--output',out,new URL(a.path,manifest.asset_base).href]);if(sha(out)!==a.sha256)throw Error(`asset hash mismatch: ${name}`)}
  inject('after-download');
  run('sha256sum',['-c','SHA256SUMS'],{cwd:downloads});run(process.execPath,[validatorFile,'archive',path.join(downloads,archive[0]),manifestFile]);
  run('tar',['-xzf',path.join(downloads,archive[0]),'-C',work,'--strip-components=1']);run('sha256sum',['-c','CHECKSUMS'],{cwd:work});
