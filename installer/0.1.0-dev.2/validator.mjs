@@ -5,8 +5,8 @@ const names=['CHECKSUMS','INSTALL.md','LICENSE','NOTICE','THIRD_PARTY_LICENSES.j
 if(mode==='archive'){
  const root='monoglobi-agent-bus-0.1.0-dev.2-kit/',list=execFileSync('tar',['-tzf',target],{encoding:'utf8'}).trim().split('\n'),ok=new Set([root,...names.map(n=>root+n)]);
  if(list.length!==ok.size||new Set(list).size!==list.length||list.some(n=>!ok.has(n)||n.includes('..')||n.startsWith('/')||n.includes('\\')))fail('archive entry');
- const verbose=execFileSync('tar',['-tvzf',target],{encoding:'utf8'});if(verbose.split('\n').some(x=>x&&!/^[d-]/.test(x)))fail('archive link');
- if(fs.statSync(target).size>5*1024*1024)fail('archive size');process.exit(0);
+ const verbose=execFileSync('tar',['-tvzf',target],{encoding:'utf8'}),rows=verbose.split('\n').filter(Boolean);if(rows.some(x=>!/^[d-]/.test(x)))fail('archive link');
+ const expanded=rows.reduce((n,x)=>n+(Number(x.trim().split(/\s+/)[2])||0),0);if(fs.statSync(target).size>5*1024*1024||expanded>8*1024*1024)fail('archive size');process.exit(0);
 }
 if(mode!=='installed')fail('mode');
 for(const n of names){const p=path.join(target,n);if(!fs.existsSync(p)||!fs.lstatSync(p).isFile())fail('必須ファイル不足: '+n)}
