@@ -1,0 +1,24 @@
+{
+  "version": "0.1.0-dev.2",
+  "source_commit": "b48f27dcfdc9225cd497be88982045666197f1a3",
+  "asset_base": "https://github.com/shinotomi-notuno/monoglobi-agent-bus/releases/download/v0.1.0-dev.2",
+  "root_lock_sha256": "9bae5beac639d9c263e1b8f39b7b3b30a805709b6809ba3c27ab1746b468789c",
+  "assets": {
+    "RELEASE-NOTES.md": {
+      "path": "RELEASE-NOTES.md",
+      "sha256": "01277fec1f0333e3308fd8acde9aa56a99d5d3709011d02758b6804bf290cf22"
+    },
+    "SHA256SUMS": {
+      "path": "SHA256SUMS",
+      "sha256": "f497430e456d5a84c06d0a250673e093bc2bfbd87d99784453a4680b314d918c"
+    },
+    "monoglobi-agent-bus-0.1.0-dev.2-kit.tar.gz": {
+      "path": "monoglobi-agent-bus-0.1.0-dev.2-kit.tar.gz",
+      "sha256": "9d0a6af4a8c935cfad1fc17545d442d3f464f0f8007a20d024c8f939ef6f00c9"
+    },
+    "source-manifest.json": {
+      "path": "source-manifest.json",
+      "sha256": "840d712f0fcc9f640d542d7cc71bad533f109e7e0ec687a7eb5e5cdf9099fc7a"
+    }
+  }
+}
