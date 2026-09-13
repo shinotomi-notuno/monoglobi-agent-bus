@@ -1,11 +1,9 @@
 # 0.1.0-dev.1
 
-Selected snapshot from internal baseline 1887146; upstream and dependency
-evaluation references are recorded separately in provenance.json.
-Distribution-only package metadata, fixed dependency shrinkwrap, four distinct
-bin names, thin initializer wrapper and explicit non-plugin operating guides.
-Business implementation is unchanged except the CLI usage name.
-Internal histories, promotional assets and upstream installation skills omitted.
-Consumer installation requires the complete checksummed root kit and npm ci
---omit=dev. Source shrinkwrap is the build lock; consumer root lock/overrides
-preserve evaluated dependencies. Standalone tgz installation is unsupported.
+内部の基準版`1887146`から選別したソースのスナップショットです。元プロジェクトと依存評価の参照情報は[provenance.json](provenance.json)に別途記録しています。
+
+配布用のパッケージ情報、依存を固定するshrinkwrap、区別可能な4つのコマンド名、薄い初期化ラッパー、プラグインを使用しない明示的な運用手順を整備しました。CLIの使用方法に表示する名前を除き、業務処理の実装は変更していません。
+
+内部履歴、広告用の画像・動画、元プロジェクトのインストール用スキルは含めていません。
+
+利用者の導入には、チェックサム付きの完全なroot kitと`npm ci --omit=dev`が必要です。ソースのshrinkwrapはビルド用lock、導入先のroot lockと`overrides`は検証済み依存を維持するためのものです。tgz単独のインストールはサポートしていません。

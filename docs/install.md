@@ -1,28 +1,21 @@
-# Install the complete root kit
+# 完全なroot kitのインストール
 
-Acquire all FOUR assets from the same reviewed Release of
-shinotomi-notuno/monoglobi-agent-bus into the SAME download directory:
+`shinotomi-notuno/monoglobi-agent-bus`の検証済みの同じReleaseから、次の**4ファイルすべて**を同じダウンロードディレクトリへ取得してください。
 
-- monoglobi-agent-bus-0.1.0-dev.1-kit.tar.gz
-- SHA256SUMS
-- source-manifest.json
-- RELEASE-NOTES.md
+- `monoglobi-agent-bus-0.1.0-dev.1-kit.tar.gz`
+- `SHA256SUMS`
+- `source-manifest.json`
+- `RELEASE-NOTES.md`
 
-Match the source commit/tag recorded in that Release and all four assets to the
-review record. SHA256SUMS checks the other three files; downloading just the kit
-and checksum file is incomplete and must fail. Checksums alone do not establish
-publisher identity.
+Releaseに記載されたソースのcommit・tagと4ファイルを検証記録と照合してください。`SHA256SUMS`は他の3ファイルを検証します。kitとチェックサムの2ファイルだけでは不足し、検証は失敗します。チェックサムだけでは公開者の身元を証明できません。
 
-From the download directory verify the outer archive:
+ダウンロードディレクトリで外側のチェックサムを検証します。
 
 ```sh
 sha256sum -c SHA256SUMS
 ```
 
-Choose a NEW dedicated directory on the Linux filesystem, not the application
-repo or an existing installation. Set AB_KIT_DIR to its absolute path. Inspect
-the archive listing; reject absolute paths, parent traversal, links, unexpected
-files or multiple roots. Extract only the verified kit:
+Linuxファイルシステム上に**新しい専用ディレクトリ**を選び、絶対パスを`AB_KIT_DIR`に設定してください。アプリケーションのリポジトリや既存のインストール先は使用しません。アーカイブ内の一覧を確認し、絶対パス、親ディレクトリへの遡及、リンク、想定外のファイル、複数のルートがあれば展開を中止してください。検証済みのkitだけを展開します。
 
 ```sh
 mkdir -m 700 "$AB_KIT_DIR"
@@ -32,31 +25,29 @@ sha256sum -c CHECKSUMS
 npm ci --omit=dev
 ```
 
-Use this root's node_modules/.bin/monoglobi-agent-bus-mcp,
-monoglobi-agent-bus-init, monoglobi-agent-bus-recover and monoglobi-agent-bus-v2.
-Keep package.json/package-lock.json/tgz/checksums together. Root lock and overrides
-fix evaluated runtime versions. The esbuild override is retained but does not add
-esbuild to runtime. Only the enclosed tgz uses a relative file: reference.
+このインストール先の`node_modules/.bin`にある次のコマンドを使用します。
 
-Do not replace npm ci with standalone tgz installation, npm install/update,
-npm link, npx latest or plugin installation. Standalone tgz install did not keep
-the evaluated tree with the tested npm. Package shrinkwrap is the source/build
-lock, not the consumer root lock. Updates replace the complete kit in a new
-directory after separate review; never edit its lock to resolve install errors.
+- `monoglobi-agent-bus-mcp`
+- `monoglobi-agent-bus-init`
+- `monoglobi-agent-bus-recover`
+- `monoglobi-agent-bus-v2`
 
-Initial measured environment: WSL2 Linux x64, glibc2.39, Node22.17.0/npm11.19.1.
-Prebuilt native addon availability depends on platform and Node ABI. Network is
-needed; do not disable all lifecycle scripts. Fallback compilation may require
-Python, make and C/C++ tools. Prebuilt success on a host with these tools does not
-prove a toolchain-free host works. Other OS/arch/npm versions are unverified.
-Engine range is not a support matrix.
+`package.json`、`package-lock.json`、tgz、チェックサムを一緒に保持してください。導入先のroot lockと`overrides`で、検証済みの実行時依存バージョンを固定します。`esbuild`のoverrideは残っていますが、実行時依存には追加されません。相対的な`file:`参照を使用するのは同梱tgzだけです。
 
-Source developers use the reviewed snapshot, npm ci, npm run build, npm run
-typecheck and npm run test:v2. Source npm-shrinkwrap.json is the build lock.
+`npm ci`を、tgz単独のインストール、`npm install/update`、`npm link`、`npx latest`、プラグインのインストールに置き換えないでください。検証したnpmでは、tgz単独の導入で検証済みの依存構成を維持できませんでした。パッケージのshrinkwrapはソースのビルド用lockであり、利用者の導入先に置くroot lockとは異なります。更新時は別途レビュー後、新しいディレクトリへkit全体を導入してください。導入エラーを解消するためにlockを書き換えないでください。
 
-Data setup is separate: use an approved new dedicated mode0700 directory.
-monoglobi-agent-bus-init takes NEW_DB_PATH and JSON_SCOPE_ARRAY; verify DB/key
-mode0600. Never use production or preserved pilot paths. See operations.md and
-recovery.md. Installation does not establish participant connections or approve
-real-data migration. Third-party correspondence and texts: docs/third-party.json
-and NOTICE, with the original LICENSE retained.
+## 動作確認環境
+
+初期実測環境はWSL2 Linux x64、glibc 2.39、Node.js 22.17.0 / npm 11.19.1です。ネイティブアドオンのビルド済みバイナリを取得できるかは、プラットフォームとNode ABIに依存します。ネットワーク接続が必要です。ライフサイクルスクリプトをすべて無効にしないでください。
+
+ソースからのビルドへ切り替わる場合、Python、make、C/C++ツールが必要になることがあります。これらのツールがある環境でビルド済みバイナリの導入に成功しても、ツールのない環境での動作を証明したことにはなりません。他のOS・アーキテクチャ・npmバージョンは未検証です。`engines`の範囲は動作確認済み環境の一覧ではありません。
+
+## ソースからの開発
+
+検証済みのスナップショットで、`npm ci`、`npm run build`、`npm run typecheck`、`npm run test:v2`を使用してください。ソースの`npm-shrinkwrap.json`がビルド用lockです。
+
+## データの準備
+
+データの準備はインストールとは別の作業です。承認済みの新しい専用ディレクトリを権限`0700`で使用してください。`monoglobi-agent-bus-init`には`NEW_DB_PATH`と`JSON_SCOPE_ARRAY`を渡し、DBと鍵の権限が`0600`であることを確認します。本番データや保全済み試行のパスは使用しないでください。
+
+[運用手順](operations.md)と[復旧手順](recovery.md)も参照してください。インストールだけでは参加者の接続や実データ移行の承認は成立しません。第三者依存の対応表と原文は[third-party.json](third-party.json)と[NOTICE](../NOTICE)にあり、元の[LICENSE](../LICENSE)を保持しています。

@@ -1,30 +1,28 @@
-# Explicit local operation
+# 明示的な設定によるローカル運用
 
-First install the verified complete root kit as described in install.md using
-npm ci --omit=dev. The prefix below is that kit root. Preserve kit checksums.
+まず[インストール手順](install.md)に従い、検証済みの完全なroot kitを`npm ci --omit=dev`で導入してください。以下の「インストール先」はそのkitのルートを指します。kitのチェックサムを保持してください。
 
-Configure the client command as the installed prefix's absolute
-node_modules/.bin/monoglobi-agent-bus-mcp path, with explicit working directory.
-Set AGENT_BUS_V2_DB to the dedicated absolute DB path and AGENT_BUS_V2_SCOPE to
-JSON containing project, area and team (explicit nulls where applicable).
-Set AGENT_BUS_V2_LEGACY=0 and initially AGENT_BUS_V2_WRITERS=0.
-Verify capabilities/read-only status and the actual initialized instance UUID
-before approved reconnection with WRITERS=1. The v2 CLI is writer-enabled;
-it is not a substitute for the MCP read-only check. Use distinct client connection
-names and explicit actor identities. Role labels are not hard RBAC.
+## クライアントの接続設定
 
-Dedicated data directory mode0700; DB, receipt-containing request files and
-cursor-key sidecar mode0600. Claim/reply tokens are stored in receipts; cursor
-keys are plaintext sidecars. MCP tokens may remain in client context/history.
-Never commit or share keys, receipts, DBs or private client transcripts.
-Same-OS-user access is the trust boundary. Real-data retention requires separate
-acceptance; installing this package does not grant it.
+クライアントの起動コマンドには、インストール先の`node_modules/.bin/monoglobi-agent-bus-mcp`の絶対パスを設定し、作業ディレクトリも明示してください。
 
-At closeout revoke active Sessions, close each client window, and confirm only
-processes matching the exact dedicated DB and installed executable have stopped.
-Preserve the complete existing artifact set including any WAL/SHM/markers;
-record permissions, ownership and final stopped hashes without secret contents.
-Set an explicit retention review date. Do not auto-delete data or clear gates.
-Package-prefix removal and data removal are separate operations.
-Interrupted or unknown outcomes stay read-only until explicit offline handling.
-Actual participant operation is not established by a scripted MCP test.
+- `AGENT_BUS_V2_DB`：専用DBの絶対パス。
+- `AGENT_BUS_V2_SCOPE`：`project`、`area`、`team`を含むJSON。該当する箇所の`null`も明示します。
+- `AGENT_BUS_V2_LEGACY=0`：旧方式を無効化。
+- 初回は`AGENT_BUS_V2_WRITERS=0`：読取専用。
+
+機能情報・読取専用状態と、実際に初期化されたインスタンスのUUIDを確認してから、承認済みの`WRITERS=1`での再接続へ進んでください。v2 CLIは書込み可能なため、MCPの読取専用確認の代わりにはなりません。クライアントごとに異なる接続名と、明示的なactor識別子を使用してください。役割ラベルは厳密なロールベースのアクセス制御（RBAC）ではありません。
+
+## データ・秘密情報の保管
+
+専用データディレクトリの権限は`0700`、DB・receiptを含むリクエストファイル・カーソル鍵の付随ファイルは`0600`にします。claim/replyトークンはreceiptに保存され、カーソル鍵は付随ファイルに平文で保存されます。MCPトークンはクライアントのコンテキストや履歴に残る場合があります。
+
+鍵・receipt・DB・非公開のクライアント会話記録をコミットしたり共有したりしないでください。同じOSユーザーによるアクセスを信頼する設計です。実データの保持には別途合意が必要であり、パッケージの導入だけで許可されたことにはなりません。
+
+## 終了と保全
+
+終了時は有効なSessionを失効させ、各クライアント画面を閉じ、専用DBとインストール済み実行ファイルに正確に一致する対象プロセスが停止したことを確認してください。
+
+存在するWAL・SHM・マーカーも含め、関連するファイル一式を保全します。秘密の内容を記録せず、権限・所有者・停止後の最終ハッシュを記録してください。保持の見直し日を明示し、自動削除やゲートの解除は行わないでください。パッケージの削除とデータの削除は別の操作です。
+
+中断や結果不明の場合は、明示的なオフライン対応まで読取専用を維持してください。スクリプトによるMCP試験だけでは、実際の参加者による運用が成立したことにはなりません。
