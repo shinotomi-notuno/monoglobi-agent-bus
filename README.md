@@ -2,7 +2,7 @@
 
 [MustaphaSteph/agent-bus](https://github.com/MustaphaSteph/agent-bus)を基に改修した、ローカルで動作するMCPメッセージバスです。
 
-開発版 **0.1.0-dev.1**、スキーマ **2.4-dev.2** を配布しています。`production_ready=false`（本番運用向けの準備は未完了）です。元プロジェクトの公式リリースではありません。自動修復、本番環境への移行、プラグインとしてのインストール、スキーマの安定性は提供・保証していません。
+開発版 **0.1.0-dev.2**、スキーマ **2.4-dev.2** を配布しています。`production_ready=false`（本番運用向けの準備は未完了）です。元プロジェクトの公式リリースではありません。自動修復、本番環境への移行、プラグインとしてのインストール、スキーマの安定性は提供・保証していません。
 
 ## ドキュメント
 
@@ -21,28 +21,16 @@
 
 ## インストール
 
-[Release一覧](https://github.com/shinotomi-notuno/monoglobi-agent-bus/releases)から、検証済みの同じリリースに添付された次の**4ファイルすべて**を、同じダウンロードディレクトリへ取得してください。
-
-- `monoglobi-agent-bus-0.1.0-dev.1-kit.tar.gz`
-- `SHA256SUMS`
-- `source-manifest.json`
-- `RELEASE-NOTES.md`
-
-Releaseに記載されたソースのcommit・tagと、取得した4ファイルの対応を確認してください。4ファイルを同じ場所に置いたまま、次のコマンドでチェックサムを検証します。
+WSL2 の Linux x64 で、Node.js 22.17.0 と npm 11.19.1 を用意してから、次の**1コマンド**をコピーして実行してください。bootstrap を完全に取得して SHA256 を照合した後にだけ実行します。親シェルの環境変数は変更せず、過去の試験用設定を子シェルから除去します。
 
 ```sh
-sha256sum -c SHA256SUMS
+env -u AB_FIXTURE_TEST -u AB_FIXTURE_URL -u AB_INSTALL_BASE -u AB_TEST_FAIL_STAGE -u AB_TEST_HTTP -u AB_TEST_NPM_REGISTRY bash -c 'set -euo pipefail; t=$(mktemp -d); trap '\''rm -rf "$t"'\'' EXIT; curl --fail --location --proto "=https" --connect-timeout 10 --max-time 120 --output "$t/bootstrap.sh" "https://raw.githubusercontent.com/shinotomi-notuno/monoglobi-agent-bus/81992e49a86260e7e51bc58509c7d9cfcbcbf01f/installer/0.1.0-dev.2/bootstrap.sh"; echo "4ee470480cb044384cfe629ea610fc7f950b905c0d426f949301db3e9cf84b2c  $t/bootstrap.sh" | sha256sum -c -; bash "$t/bootstrap.sh"'
 ```
 
-続いて[インストール手順](docs/install.md)に従い、検証したアーカイブを新しい専用ディレクトリへ展開してください。展開先で内側のチェックサムを検証し、依存パッケージをインストールします。
+成功時は完了メッセージと導入先を表示します。続けて、承認済みの新しい専用ディレクトリでデータ接続の準備を行ってください。接続設定は[運用手順](docs/operations.md)と[インストール手順](docs/install.md#データの準備)に従います。
 
-```sh
-sha256sum -c CHECKSUMS
-npm ci --omit=dev
-```
+ネットワークやnpmの失敗後に消してよいのは、`~/.local/share/monoglobi-agent-bus/.work` 内の失敗した作業領域だけです。DB、鍵、既存の導入先は削除しません。
 
-コマンドは、そのインストール先の`node_modules/.bin`にあるものを使用してください。
-
-同梱のtgzを単独でインストールする方法はサポートしていません。元プロジェクトの最新版、`npm link`、プラグインによる導入は使用しないでください。
+手動で確認しながら導入する場合は、[インストール手順](docs/install.md#手動導入の補助手順)を使用してください。同梱のtgzを単独でインストールする方法、`npm link`、プラグインによる導入は使用しないでください。
 
 GitHubで公開しているソースのスナップショットに、内部の開発履歴は含まれていません。
