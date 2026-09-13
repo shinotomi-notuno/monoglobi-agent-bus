@@ -27,6 +27,7 @@ try{
  run('npm',['ci','--omit=dev','--cache',path.join(work,'npm-cache'),'--userconfig',config,'--globalconfig',globalConfig,'--foreground-scripts','--no-audit','--no-fund'],{cwd:work,env:{...process.env,NPM_CONFIG_USERCONFIG:config,NPM_CONFIG_GLOBALCONFIG:globalConfig}});
  run(process.execPath,[validatorFile,'installed',work,manifestFile]);
  if(fs.existsSync(prefix))throw Error(`確定先が競合しました: ${prefix}`);
- fs.renameSync(work,prefix); run(process.execPath,[validatorFile,'installed',prefix,manifestFile]);
+ const before=fs.statSync(work);run('mv',['-T','--no-clobber',work,prefix]);const after=fs.statSync(prefix);if(after.dev!==before.dev||after.ino!==before.ino)throw Error(`確定先が競合しました: ${prefix}`);
+ run(process.execPath,[validatorFile,'installed',prefix,manifestFile]);
  console.log(`導入完了: ${manifest.version}\n保存先: ${prefix}\nMCP: ${path.join(prefix,'node_modules/.bin/monoglobi-agent-bus-mcp')}\n次は ${path.join(prefix,'INSTALL.md')} の「接続準備」を実施してください。`);
 }catch(e){fs.appendFileSync(path.join(work,'install.log'),String(e.stack??e)+'\n');fail(e.message,work)}
