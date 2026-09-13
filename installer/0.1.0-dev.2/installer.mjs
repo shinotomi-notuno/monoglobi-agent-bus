@@ -26,7 +26,8 @@ try{
  run('sha256sum',['-c','SHA256SUMS'],{cwd:downloads});run(process.execPath,[validatorFile,'archive',path.join(downloads,archive[0]),manifestFile]);
  run('tar',['-xzf',path.join(downloads,archive[0]),'-C',work,'--strip-components=1']);run('sha256sum',['-c','CHECKSUMS'],{cwd:work});
  const config=path.join(work,'npmrc'),globalConfig=path.join(work,'npm-globalrc');fs.writeFileSync(config,'fund=false\naudit=false\n');fs.writeFileSync(globalConfig,'fund=false\naudit=false\n');
- run('npm',['ci','--omit=dev','--cache',path.join(work,'npm-cache'),'--userconfig',config,'--globalconfig',globalConfig,'--foreground-scripts','--no-audit','--no-fund'],{cwd:work,env:{...process.env,NPM_CONFIG_USERCONFIG:config,NPM_CONFIG_GLOBALCONFIG:globalConfig}});
+ const npmEnv={PATH:process.env.PATH,HOME:process.env.HOME,TMPDIR:process.env.TMPDIR??'/tmp',NPM_CONFIG_USERCONFIG:config,NPM_CONFIG_GLOBALCONFIG:globalConfig};const npmArgs=['ci','--omit=dev','--cache',path.join(work,'npm-cache'),'--userconfig',config,'--globalconfig',globalConfig,'--foreground-scripts','--no-audit','--no-fund'];if(process.env.AB_FIXTURE_TEST==='1'&&process.env.AB_TEST_NPM_REGISTRY)npmArgs.push('--registry',process.env.AB_TEST_NPM_REGISTRY);
+ run('npm',npmArgs,{cwd:work,env:npmEnv});
  inject('after-npm');
  run(process.execPath,[validatorFile,'installed',work,manifestFile]);
  if(fs.existsSync(prefix))throw Error(`確定先が競合しました: ${prefix}`);
