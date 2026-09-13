@@ -3,7 +3,7 @@
 WSL2 の Linux x64 で実行します。必要環境は Node.js 22.17.0、npm 11.19.1、`curl`、`sha256sum`です。次の1コマンドは、固定commitのbootstrapをHTTPSで取得し、完全取得とSHA256一致の後だけ実行します。試験用の環境変数は子シェルだけで取り除くため、親シェルの設定は変わりません。
 
 ```sh
-env -u AB_FIXTURE_TEST -u AB_FIXTURE_URL -u AB_INSTALL_BASE -u AB_TEST_FAIL_STAGE -u AB_TEST_HTTP -u AB_TEST_NPM_REGISTRY bash -c 'set -euo pipefail; t=$(mktemp -d); trap '\''rm -rf "$t"'\'' EXIT; curl --fail --location --proto "=https" --connect-timeout 10 --max-time 120 --output "$t/bootstrap.sh" "https://raw.githubusercontent.com/shinotomi-notuno/monoglobi-agent-bus/81992e49a86260e7e51bc58509c7d9cfcbcbf01f/installer/0.1.0-dev.2/bootstrap.sh"; echo "4ee470480cb044384cfe629ea610fc7f950b905c0d426f949301db3e9cf84b2c  $t/bootstrap.sh" | sha256sum -c -; bash "$t/bootstrap.sh"'
+env -u AB_FIXTURE_TEST -u AB_FIXTURE_URL -u AB_INSTALL_BASE -u AB_TEST_FAIL_STAGE -u AB_TEST_HTTP -u AB_TEST_NPM_REGISTRY bash -c 'set -euo pipefail; t=$(mktemp -d); trap '\''rm -rf "$t"'\'' EXIT; curl --fail --location --proto "=https" --connect-timeout 10 --max-time 120 --output "$t/bootstrap.sh" "https://raw.githubusercontent.com/shinotomi-notuno/monoglobi-agent-bus/021356d8603f53f41be4bfcf7a96d2213140f8f0/installer/0.1.0-dev.2/bootstrap.sh"; echo "297e7de01c2b9e617ff452177198579092861a5ff932500989d927b6cdb2de44  $t/bootstrap.sh" | sha256sum -c -; bash "$t/bootstrap.sh"'
 ```
 
 成功時は完了メッセージと導入先が表示されます。接続用のDBと鍵は導入とは別に、承認済みの新しい専用ディレクトリで準備します。[運用手順](operations.md)と下記の「データの準備」を参照してください。
