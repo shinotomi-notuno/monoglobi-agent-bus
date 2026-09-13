@@ -1,0 +1,83 @@
+{
+  "name": "monoglobi-agent-bus",
+  "version": "0.1.0-dev.1",
+  "homepage": "https://github.com/shinotomi-notuno/monoglobi-agent-bus",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shinotomi-notuno/monoglobi-agent-bus.git"
+  },
+  "bugs": {
+    "url": "https://github.com/shinotomi-notuno/monoglobi-agent-bus/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "claude-code",
+    "codex",
+    "agents",
+    "ai-agents",
+    "multi-agent",
+    "agent-orchestration",
+    "agent-to-agent",
+    "message-bus",
+    "sqlite",
+    "typescript",
+    "local-first"
+  ],
+  "description": "Local message bus that lets Claude Code, Codex and other MCP agents talk to each other through one SQLite file.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "monoglobi-agent-bus-v2": "dist/v2/cli.js",
+    "monoglobi-agent-bus-mcp": "dist/v2/server.js",
+    "monoglobi-agent-bus-init": "dist/v2/init-cli.js",
+    "monoglobi-agent-bus-recover": "dist/v2/recovery-cli.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "dist/**/*.d.ts",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "docs/install.md",
+    "docs/operations.md",
+    "docs/recovery.md",
+    "provenance.json",
+    "CHANGELOG.md",
+    "npm-shrinkwrap.json",
+    "docs/third-party.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "prepack": "npm run build",
+    "test:v2": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "better-sqlite3": "^11.3.0",
+    "commander": "^12.1.0",
+    "kleur": "^4.1.5",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.0.0",
+    "tsx": "4.22.0",
+    "typescript": "^5.6.0"
+  },
+  "overrides": {
+    "@hono/node-server": "1.19.15",
+    "body-parser": "2.3.0",
+    "fast-uri": "3.1.6",
+    "hono": "4.12.34",
+    "ip-address": "10.3.1",
+    "qs": "6.16.0",
+    "esbuild": "0.28.1"
+  },
+  "private": true
+}

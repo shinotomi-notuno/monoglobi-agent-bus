@@ -1,0 +1,536 @@
+import Database from "better-sqlite3";
+import { dbPath } from "./util/paths.js";
+
+let cached: Database.Database | null = null;
+
+export function getDb(): Database.Database {
+  if (cached) return cached;
+  const db = new Database(dbPath());
+  if (db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='bus_meta'").get()) {
+    db.close();
+    throw new Error("V2_DB_REQUIRES_V2_ENTRYPOINT: legacy core cannot open a v2 database");
+  }
+  db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = NORMAL");
+  db.pragma("foreign_keys = ON");
+  initializeLegacySchema(db);
+  cached = db;
+  return db;
+}
+
+export function closeDb(): void {
+  if (cached) {
+    cached.close();
+    cached = null;
+  }
+}
+
+interface ColumnInfo {
+  name: string;
+}
+
+function tableColumns(db: Database.Database, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as ColumnInfo[];
+  return new Set(rows.map((r) => r.name));
+}
+
+const TASK_CORE_INDEXES_SQL = `
+  CREATE INDEX IF NOT EXISTS idx_tasks_state_claimed
+    ON tasks(state, claimed_by);
+  CREATE INDEX IF NOT EXISTS idx_tasks_requested_by
+    ON tasks(requested_by);
+  CREATE INDEX IF NOT EXISTS idx_tasks_thread
+    ON tasks(thread_id);
+  CREATE INDEX IF NOT EXISTS idx_tasks_blocked_on
+    ON tasks(blocked_on_task_id);
+`;
+
+function taskSchemaSql(db: Database.Database): string {
+  const row = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'")
+    .get() as { sql: string } | undefined;
+  return row?.sql ?? "";
+}
+
+function rebuildTasksTableForBacklog(db: Database.Database): void {
+  const schema = taskSchemaSql(db);
+  if (schema.includes("'backlog'") && schema.includes("milestone")) return;
+  const previousForeignKeys = db.pragma("foreign_keys", { simple: true }) as number;
+  db.pragma("foreign_keys = OFF");
+  let committed = false;
+  try {
+    db.exec("BEGIN IMMEDIATE");
+    db.exec(`
+      DROP TABLE IF EXISTS tasks_new;
+      CREATE TABLE tasks_new (
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        title               TEXT NOT NULL,
+        description         TEXT,
+        thread_id           TEXT NOT NULL,
+        requested_by        TEXT NOT NULL REFERENCES agents(name),
+        claimed_by          TEXT REFERENCES agents(name),
+        state               TEXT NOT NULL CHECK (state IN ('backlog','open','claimed','working','blocked','completed','failed','canceled')),
+        milestone           TEXT,
+        priority            INTEGER NOT NULL DEFAULT 0,
+        cwd                 TEXT,
+        blocked_reason      TEXT,
+        blocked_on_task_id  INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+        result              TEXT,
+        created_at          INTEGER NOT NULL,
+        updated_at          INTEGER NOT NULL,
+        claimed_at          INTEGER,
+        finished_at         INTEGER,
+        project             TEXT,
+        area                TEXT,
+        team                TEXT,
+        required_capability TEXT,
+        mode                TEXT NOT NULL DEFAULT 'edit_files',
+        expected_output     TEXT,
+        deadline_at         INTEGER,
+        checkin_at          INTEGER,
+        final_answer        TEXT,
+        manager_reviewed    INTEGER NOT NULL DEFAULT 0,
+        file_scope          TEXT NOT NULL DEFAULT '[]',
+        ack_required        INTEGER NOT NULL DEFAULT 0,
+        acknowledged_at     INTEGER,
+        acknowledged_by     TEXT,
+        review_required     INTEGER NOT NULL DEFAULT 0,
+        independent_review  INTEGER NOT NULL DEFAULT 0,
+        review_state        TEXT NOT NULL DEFAULT 'none',
+        reviewed_by         TEXT,
+        review_notes        TEXT,
+        changed_files       TEXT NOT NULL DEFAULT '[]',
+        edit_scope          TEXT NOT NULL DEFAULT '[]',
+        read_scope          TEXT NOT NULL DEFAULT '[]',
+        pending_assignee    TEXT,
+        phase               TEXT,
+        session_id          TEXT
+      );
+      INSERT INTO tasks_new (
+        id, title, description, thread_id, requested_by, claimed_by, state,
+        milestone, priority, cwd, blocked_reason, blocked_on_task_id, result,
+        created_at, updated_at, claimed_at, finished_at, project, area, team,
+        required_capability, mode, expected_output, deadline_at, checkin_at,
+        final_answer, manager_reviewed, file_scope, ack_required,
+        acknowledged_at, acknowledged_by, review_required, independent_review,
+        review_state, reviewed_by, review_notes, changed_files, edit_scope,
+        read_scope, pending_assignee, phase, session_id
+      )
+      SELECT
+        id, title, description, thread_id, requested_by, claimed_by, state,
+        milestone, priority, cwd, blocked_reason, blocked_on_task_id, result,
+        created_at, updated_at, claimed_at, finished_at, project, area, team,
+        required_capability, mode, expected_output, deadline_at, checkin_at,
+        final_answer, manager_reviewed, file_scope, ack_required,
+        acknowledged_at, acknowledged_by, review_required, independent_review,
+        review_state, reviewed_by, review_notes, changed_files, edit_scope,
+        read_scope, pending_assignee, phase, session_id
+      FROM tasks;
+      DROP TABLE tasks;
+      ALTER TABLE tasks_new RENAME TO tasks;
+      ${TASK_CORE_INDEXES_SQL}
+    `);
+    const violations = db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) {
+      throw new Error(`tasks migration failed foreign_key_check (${violations.length} violation${violations.length === 1 ? "" : "s"})`);
+    }
+    db.exec("COMMIT");
+    committed = true;
+  } finally {
+    if (!committed) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {
+        // Ignore rollback failures when SQLite has already unwound the transaction.
+      }
+    }
+    if (previousForeignKeys) db.pragma("foreign_keys = ON");
+  }
+}
+
+export function initializeLegacySchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agents (
+      name           TEXT PRIMARY KEY,
+      capabilities   TEXT NOT NULL DEFAULT '[]',
+      registered_at  INTEGER NOT NULL,
+      last_seen      INTEGER NOT NULL,
+      paused         INTEGER NOT NULL DEFAULT 0,
+      project        TEXT,
+      area           TEXT,
+      team           TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS messages (
+      id            INTEGER PRIMARY KEY AUTOINCREMENT,
+      from_agent    TEXT NOT NULL,
+      to_agent      TEXT NOT NULL,
+      kind          TEXT NOT NULL CHECK (kind IN ('msg','ask','reply')),
+      content       TEXT NOT NULL,
+      reply_to      INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+      status        TEXT NOT NULL CHECK (status IN ('pending','delivered','answered')),
+      created_at    INTEGER NOT NULL,
+      delivered_at  INTEGER,
+      replied_at    INTEGER,
+      thread_id     TEXT,
+      claim_deadline INTEGER,
+      claimed_by    TEXT,
+      channel       TEXT,
+      project       TEXT,
+      area          TEXT,
+      team          TEXT,
+      priority      TEXT NOT NULL DEFAULT 'normal'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_messages_to_status
+      ON messages(to_agent, status, id);
+    CREATE INDEX IF NOT EXISTS idx_messages_reply_to
+      ON messages(reply_to);
+
+    CREATE TABLE IF NOT EXISTS subscriptions (
+      channel        TEXT NOT NULL,
+      agent          TEXT NOT NULL REFERENCES agents(name) ON DELETE CASCADE,
+      subscribed_at  INTEGER NOT NULL,
+      PRIMARY KEY (channel, agent)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_subscriptions_channel
+      ON subscriptions(channel);
+
+    CREATE TABLE IF NOT EXISTS tasks (
+      id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+      title               TEXT NOT NULL,
+      description         TEXT,
+      thread_id           TEXT NOT NULL,
+      requested_by        TEXT NOT NULL REFERENCES agents(name),
+      claimed_by          TEXT REFERENCES agents(name),
+      state               TEXT NOT NULL CHECK (state IN ('backlog','open','claimed','working','blocked','completed','failed','canceled')),
+      milestone           TEXT,
+      priority            INTEGER NOT NULL DEFAULT 0,
+      cwd                 TEXT,
+      blocked_reason      TEXT,
+      blocked_on_task_id  INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+      result              TEXT,
+      created_at          INTEGER NOT NULL,
+      updated_at          INTEGER NOT NULL,
+      claimed_at          INTEGER,
+      finished_at         INTEGER,
+      project             TEXT,
+      area                TEXT,
+      team                TEXT
+    );
+
+    ${TASK_CORE_INDEXES_SQL}
+  `);
+
+  const messageCols = tableColumns(db, "messages");
+  if (!messageCols.has("thread_id")) {
+    db.exec(`ALTER TABLE messages ADD COLUMN thread_id TEXT`);
+  }
+  if (!messageCols.has("claim_deadline")) {
+    db.exec(`ALTER TABLE messages ADD COLUMN claim_deadline INTEGER`);
+  }
+  if (!messageCols.has("claimed_by")) {
+    db.exec(`ALTER TABLE messages ADD COLUMN claimed_by TEXT`);
+  }
+  if (!messageCols.has("channel")) {
+    db.exec(`ALTER TABLE messages ADD COLUMN channel TEXT`);
+  }
+  if (!messageCols.has("project")) {
+    db.exec(`ALTER TABLE messages ADD COLUMN project TEXT`);
+  }
+  if (!messageCols.has("area")) {
+    db.exec(`ALTER TABLE messages ADD COLUMN area TEXT`);
+  }
+  if (!messageCols.has("team")) {
+    db.exec(`ALTER TABLE messages ADD COLUMN team TEXT`);
+  }
+  if (!messageCols.has("priority")) {
+    db.exec(`ALTER TABLE messages ADD COLUMN priority TEXT NOT NULL DEFAULT 'normal'`);
+  }
+
+  const agentCols = tableColumns(db, "agents");
+  if (!agentCols.has("project")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN project TEXT`);
+  }
+  if (!agentCols.has("area")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN area TEXT`);
+  }
+  if (!agentCols.has("team")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN team TEXT`);
+  }
+  if (!agentCols.has("role")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN role TEXT`);
+  }
+  if (!agentCols.has("routing_weight")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN routing_weight INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!agentCols.has("status")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN status TEXT NOT NULL DEFAULT 'idle'`);
+  }
+  if (!agentCols.has("session_id")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN session_id TEXT`);
+  }
+  if (!agentCols.has("removed_at")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN removed_at INTEGER`);
+  }
+  if (!agentCols.has("bus_version")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN bus_version TEXT`);
+  }
+  if (!agentCols.has("listening_until")) {
+    db.exec(`ALTER TABLE agents ADD COLUMN listening_until INTEGER`);
+  }
+
+  const taskCols = tableColumns(db, "tasks");
+  if (!taskCols.has("project")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN project TEXT`);
+  }
+  if (!taskCols.has("area")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN area TEXT`);
+  }
+  if (!taskCols.has("team")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN team TEXT`);
+  }
+  if (!taskCols.has("milestone")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN milestone TEXT`);
+  }
+  if (!taskCols.has("required_capability")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN required_capability TEXT`);
+  }
+  if (!taskCols.has("mode")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN mode TEXT NOT NULL DEFAULT 'edit_files'`);
+  }
+  if (!taskCols.has("expected_output")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN expected_output TEXT`);
+  }
+  if (!taskCols.has("deadline_at")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN deadline_at INTEGER`);
+  }
+  if (!taskCols.has("checkin_at")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN checkin_at INTEGER`);
+  }
+  if (!taskCols.has("final_answer")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN final_answer TEXT`);
+  }
+  if (!taskCols.has("manager_reviewed")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN manager_reviewed INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!taskCols.has("file_scope")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN file_scope TEXT NOT NULL DEFAULT '[]'`);
+  }
+  if (!taskCols.has("ack_required")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN ack_required INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!taskCols.has("acknowledged_at")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN acknowledged_at INTEGER`);
+  }
+  if (!taskCols.has("acknowledged_by")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN acknowledged_by TEXT`);
+  }
+  if (!taskCols.has("review_required")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN review_required INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!taskCols.has("independent_review")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN independent_review INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!taskCols.has("review_state")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN review_state TEXT NOT NULL DEFAULT 'none'`);
+  }
+  if (!taskCols.has("reviewed_by")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN reviewed_by TEXT`);
+  }
+  if (!taskCols.has("review_notes")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN review_notes TEXT`);
+  }
+  if (!taskCols.has("changed_files")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN changed_files TEXT NOT NULL DEFAULT '[]'`);
+  }
+  if (!taskCols.has("edit_scope")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN edit_scope TEXT NOT NULL DEFAULT '[]'`);
+  }
+  if (!taskCols.has("read_scope")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN read_scope TEXT NOT NULL DEFAULT '[]'`);
+  }
+  if (!taskCols.has("pending_assignee")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN pending_assignee TEXT`);
+  }
+  if (!taskCols.has("phase")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN phase TEXT`);
+  }
+  if (!taskCols.has("session_id")) {
+    db.exec(`ALTER TABLE tasks ADD COLUMN session_id TEXT`);
+  }
+  rebuildTasksTableForBacklog(db);
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS decisions (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      by_agent        TEXT NOT NULL REFERENCES agents(name),
+      decision        TEXT NOT NULL,
+      rationale       TEXT,
+      implemented     INTEGER NOT NULL DEFAULT 0,
+      project         TEXT,
+      area            TEXT,
+      team            TEXT,
+      created_at      INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS memories (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      by_agent        TEXT NOT NULL REFERENCES agents(name),
+      agent           TEXT,
+      kind            TEXT NOT NULL,
+      content         TEXT NOT NULL,
+      project         TEXT,
+      area            TEXT,
+      team            TEXT,
+      task_id         INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+      thread_id       TEXT,
+      pinned          INTEGER NOT NULL DEFAULT 0,
+      supersedes_id   INTEGER REFERENCES memories(id) ON DELETE SET NULL,
+      created_at      INTEGER NOT NULL,
+      updated_at      INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS test_results (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      by_agent        TEXT NOT NULL REFERENCES agents(name),
+      task_id         INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
+      command         TEXT NOT NULL,
+      status          TEXT NOT NULL CHECK (status IN ('passed','failed','skipped')),
+      output_summary  TEXT,
+      project         TEXT,
+      area            TEXT,
+      team            TEXT,
+      created_at      INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS task_events (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      task_id         INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+      by_agent        TEXT NOT NULL REFERENCES agents(name),
+      event_type      TEXT NOT NULL CHECK (event_type IN ('note','phase','progress','log','result','cancel')),
+      message         TEXT NOT NULL,
+      phase           TEXT,
+      metadata        TEXT NOT NULL DEFAULT '{}',
+      project         TEXT,
+      area            TEXT,
+      team            TEXT,
+      created_at      INTEGER NOT NULL
+    );
+  `);
+
+  const memoryCols = tableColumns(db, "memories");
+  const decisionCols = tableColumns(db, "decisions");
+  const testResultCols = tableColumns(db, "test_results");
+  const taskEventCols = tableColumns(db, "task_events");
+  if (!decisionCols.has("team")) {
+    db.exec(`ALTER TABLE decisions ADD COLUMN team TEXT`);
+  }
+  if (!memoryCols.has("team")) {
+    db.exec(`ALTER TABLE memories ADD COLUMN team TEXT`);
+  }
+  if (!testResultCols.has("team")) {
+    db.exec(`ALTER TABLE test_results ADD COLUMN team TEXT`);
+  }
+  if (!testResultCols.has("git_ref")) {
+    db.exec(`ALTER TABLE test_results ADD COLUMN git_ref TEXT`);
+  }
+  if (!testResultCols.has("cwd")) {
+    db.exec(`ALTER TABLE test_results ADD COLUMN cwd TEXT`);
+  }
+  if (!taskEventCols.has("team")) {
+    db.exec(`ALTER TABLE task_events ADD COLUMN team TEXT`);
+  }
+  if (!memoryCols.has("pinned")) {
+    db.exec(`ALTER TABLE memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!memoryCols.has("supersedes_id")) {
+    db.exec(`ALTER TABLE memories ADD COLUMN supersedes_id INTEGER REFERENCES memories(id) ON DELETE SET NULL`);
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_messages_thread
+      ON messages(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_messages_claim
+      ON messages(claim_deadline);
+    CREATE INDEX IF NOT EXISTS idx_messages_project
+      ON messages(project);
+    CREATE INDEX IF NOT EXISTS idx_messages_area
+      ON messages(area);
+    CREATE INDEX IF NOT EXISTS idx_messages_team
+      ON messages(team);
+    CREATE INDEX IF NOT EXISTS idx_messages_priority
+      ON messages(priority);
+    CREATE INDEX IF NOT EXISTS idx_agents_project
+      ON agents(project);
+    CREATE INDEX IF NOT EXISTS idx_agents_area
+      ON agents(area);
+    CREATE INDEX IF NOT EXISTS idx_agents_team
+      ON agents(team);
+    CREATE INDEX IF NOT EXISTS idx_agents_role
+      ON agents(role);
+    CREATE INDEX IF NOT EXISTS idx_agents_status
+      ON agents(status);
+    CREATE INDEX IF NOT EXISTS idx_agents_session
+      ON agents(session_id);
+    CREATE INDEX IF NOT EXISTS idx_agents_removed
+      ON agents(removed_at);
+    CREATE INDEX IF NOT EXISTS idx_tasks_project
+      ON tasks(project);
+    CREATE INDEX IF NOT EXISTS idx_tasks_area
+      ON tasks(area);
+    CREATE INDEX IF NOT EXISTS idx_tasks_team
+      ON tasks(team);
+    CREATE INDEX IF NOT EXISTS idx_tasks_required_capability
+      ON tasks(required_capability);
+    CREATE INDEX IF NOT EXISTS idx_tasks_mode
+      ON tasks(mode);
+    CREATE INDEX IF NOT EXISTS idx_tasks_manager_reviewed
+      ON tasks(manager_reviewed);
+    CREATE INDEX IF NOT EXISTS idx_tasks_review_state
+      ON tasks(review_state);
+    CREATE INDEX IF NOT EXISTS idx_tasks_ack_required
+      ON tasks(ack_required);
+    CREATE INDEX IF NOT EXISTS idx_tasks_pending_assignee
+      ON tasks(pending_assignee);
+    CREATE INDEX IF NOT EXISTS idx_tasks_phase
+      ON tasks(phase);
+    CREATE INDEX IF NOT EXISTS idx_tasks_session
+      ON tasks(session_id);
+    CREATE INDEX IF NOT EXISTS idx_decisions_scope
+      ON decisions(project, area);
+    CREATE INDEX IF NOT EXISTS idx_decisions_team
+      ON decisions(team);
+    CREATE INDEX IF NOT EXISTS idx_memories_scope
+      ON memories(project, area);
+    CREATE INDEX IF NOT EXISTS idx_memories_team
+      ON memories(team);
+    CREATE INDEX IF NOT EXISTS idx_memories_agent
+      ON memories(agent);
+    CREATE INDEX IF NOT EXISTS idx_memories_kind
+      ON memories(kind);
+    CREATE INDEX IF NOT EXISTS idx_memories_task
+      ON memories(task_id);
+    CREATE INDEX IF NOT EXISTS idx_memories_thread
+      ON memories(thread_id);
+    CREATE INDEX IF NOT EXISTS idx_memories_pinned
+      ON memories(pinned)
+      WHERE pinned = 1;
+    CREATE INDEX IF NOT EXISTS idx_test_results_scope
+      ON test_results(project, area);
+    CREATE INDEX IF NOT EXISTS idx_test_results_team
+      ON test_results(team);
+    CREATE INDEX IF NOT EXISTS idx_test_results_task
+      ON test_results(task_id);
+    CREATE INDEX IF NOT EXISTS idx_task_events_task
+      ON task_events(task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_task_events_scope
+      ON task_events(project, area);
+    CREATE INDEX IF NOT EXISTS idx_task_events_team
+      ON task_events(team);
+    CREATE INDEX IF NOT EXISTS idx_task_events_type
+      ON task_events(event_type);
+  `);
+}

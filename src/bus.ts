@@ -1,0 +1,5218 @@
+import {legacyCore} from './v2/legacy-adapter.js';
+import { getDb } from "./db.js";
+import { BusError } from "./util/errors.js";
+import { runLocalHook } from "./util/hooks.js";
+import { now, sleep } from "./util/time.js";
+
+export const MAX_ASK_TIMEOUT_S = 110;
+export const MAX_INBOX_WAIT_S = 110;
+const ACTIVE_ASK_CYCLE_WINDOW_MS = MAX_ASK_TIMEOUT_S * 1000;
+
+function readPollInterval(): number {
+  const raw = process.env.AGENT_BUS_POLL_MS;
+  if (!raw) return 50;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 5) return 50;
+  return Math.min(parsed, 5000);
+}
+
+export const POLL_INTERVAL_MS = readPollInterval();
+export const LISTENING_HORIZON_MS = Math.max(5000, 3 * POLL_INTERVAL_MS);
+
+export type MessageKind = "msg" | "ask" | "reply";
+export type MessageStatus = "pending" | "delivered" | "answered";
+export type MessagePriority = "low" | "normal" | "high" | "urgent";
+export type AgentRole = "pm" | "worker" | "verifier" | "reviewer" | "listener" | string;
+export type AgentStatus = "idle" | "working" | "blocked" | "waiting_review" | "sleeping";
+export type TaskMode = "investigate_only" | "propose_patch" | "edit_files" | "test_only";
+export type MemoryKind = "summary" | "handoff" | "risk" | "todo" | "fact" | "blocker" | "lesson" | "gotcha" | string;
+export type TaskReviewState = "none" | "pending" | "approved" | "changes_requested";
+export type TaskAckResponse = "claimed" | "declined" | "blocked";
+export type TestResultStatus = "passed" | "failed" | "skipped";
+export type TaskEventType = "note" | "phase" | "progress" | "log" | "result" | "cancel";
+
+export const PROJECT_WILDCARD = "*";
+export const AREA_WILDCARD = PROJECT_WILDCARD;
+export const TEAM_WILDCARD = PROJECT_WILDCARD;
+
+export interface Agent {
+  name: string;
+  capabilities: string[];
+  registered_at: number;
+  last_seen: number;
+  paused: boolean;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  role: AgentRole | null;
+  routing_weight: number;
+  status: AgentStatus;
+  session_id: string | null;
+  removed_at: number | null;
+  bus_version: string | null;
+  listening_until: number | null;
+}
+
+export interface Message {
+  id: number;
+  from_agent: string;
+  to_agent: string;
+  kind: MessageKind;
+  content: string;
+  reply_to: number | null;
+  status: MessageStatus;
+  created_at: number;
+  delivered_at: number | null;
+  replied_at: number | null;
+  thread_id: string;
+  claim_deadline: number | null;
+  claimed_by: string | null;
+  channel: string | null;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  priority: MessagePriority;
+}
+
+export interface MessagePreview extends Omit<Message, "content"> {
+  content_preview: string;
+  content_length: number;
+  truncated: boolean;
+}
+
+export interface Subscription {
+  channel: string;
+  agent: string;
+  subscribed_at: number;
+}
+
+interface AgentRow {
+  name: string;
+  capabilities: string;
+  registered_at: number;
+  last_seen: number;
+  paused: number;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  role: AgentRole | null;
+  routing_weight: number;
+  status: AgentStatus;
+  session_id: string | null;
+  removed_at: number | null;
+  bus_version: string | null;
+  listening_until: number | null;
+}
+
+interface MessageRow {
+  id: number;
+  from_agent: string;
+  to_agent: string;
+  kind: MessageKind;
+  content: string;
+  reply_to: number | null;
+  status: MessageStatus;
+  created_at: number;
+  delivered_at: number | null;
+  replied_at: number | null;
+  thread_id: string | null;
+  claim_deadline: number | null;
+  claimed_by: string | null;
+  channel: string | null;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  priority: MessagePriority;
+}
+
+function toAgent(row: AgentRow): Agent {
+  return {
+    name: row.name,
+    capabilities: JSON.parse(row.capabilities) as string[],
+    registered_at: row.registered_at,
+    last_seen: row.last_seen,
+    paused: row.paused === 1,
+    project: row.project,
+    area: row.area,
+    team: row.team,
+    role: row.role,
+    routing_weight: row.routing_weight,
+    status: row.status,
+    session_id: row.session_id,
+    removed_at: row.removed_at,
+    bus_version: row.bus_version,
+    listening_until: row.listening_until,
+  };
+}
+
+function toMessage(row: MessageRow): Message {
+  return {
+    id: row.id,
+    from_agent: row.from_agent,
+    to_agent: row.to_agent,
+    kind: row.kind,
+    content: row.content,
+    reply_to: row.reply_to,
+    status: row.status,
+    created_at: row.created_at,
+    delivered_at: row.delivered_at,
+    replied_at: row.replied_at,
+    thread_id: row.thread_id ?? "",
+    claim_deadline: row.claim_deadline,
+    claimed_by: row.claimed_by,
+    channel: row.channel,
+    project: row.project,
+    area: row.area,
+    team: row.team,
+    priority: row.priority,
+  };
+}
+
+function previewContent(content: string, previewChars: number): { content_preview: string; content_length: number; truncated: boolean } {
+  const contentLength = content.length;
+  const truncated = contentLength > previewChars;
+  return {
+    content_preview: truncated ? content.slice(0, previewChars) : content,
+    content_length: contentLength,
+    truncated,
+  };
+}
+
+function toMessagePreview(row: MessageRow, previewChars = 300): MessagePreview {
+  const message = toMessage(row);
+  const { content, ...withoutContent } = message;
+  return {
+    ...withoutContent,
+    ...previewContent(content, Math.min(Math.max(previewChars, 0), 4000)),
+  };
+}
+
+function getMessageRow(id: number): MessageRow {
+  const row = getDb()
+    .prepare("SELECT * FROM messages WHERE id = ?")
+    .get(id) as MessageRow | undefined;
+  if (!row) throw new BusError("MESSAGE_NOT_FOUND", `no message with id ${id}`);
+  return row;
+}
+
+function validateScopeName(kind: "project" | "area" | "team" | "role", value: string | null | undefined): void {
+  if (value === null || value === undefined) return;
+  if (typeof value !== "string" || value.length === 0 || value.length > 64) {
+    throw new BusError("INVALID_INPUT", `${kind} must be 1-64 chars or omitted`);
+  }
+  if (!/^[a-zA-Z0-9_.-]+$/.test(value)) {
+    throw new BusError(
+      "INVALID_INPUT",
+      `${kind} may only contain letters, digits, _ . -`,
+    );
+  }
+}
+
+function validateProject(project: string | null | undefined): void {
+  validateScopeName("project", project);
+}
+
+function validateArea(area: string | null | undefined): void {
+  if (area === AREA_WILDCARD) return;
+  validateScopeName("area", area);
+}
+
+function validateTeam(team: string | null | undefined): void {
+  if (team === TEAM_WILDCARD) return;
+  validateScopeName("team", team);
+}
+
+function validateRole(role: string | null | undefined): void {
+  validateScopeName("role", role);
+}
+
+function validatePriority(priority: MessagePriority | undefined): void {
+  if (priority === undefined) return;
+  if (!["low", "normal", "high", "urgent"].includes(priority)) {
+    throw new BusError("INVALID_INPUT", "priority must be low, normal, high, or urgent");
+  }
+}
+
+function validateAgentStatus(status: AgentStatus | undefined): void {
+  if (status === undefined) return;
+  if (!["idle", "working", "blocked", "waiting_review", "sleeping"].includes(status)) {
+    throw new BusError("INVALID_INPUT", "status must be idle, working, blocked, waiting_review, or sleeping");
+  }
+}
+
+function validateTaskMode(mode: TaskMode | undefined): void {
+  if (mode === undefined) return;
+  if (!["investigate_only", "propose_patch", "edit_files", "test_only"].includes(mode)) {
+    throw new BusError("INVALID_INPUT", "mode must be investigate_only, propose_patch, edit_files, or test_only");
+  }
+}
+
+function validateReviewState(state: TaskReviewState | undefined): void {
+  if (state === undefined) return;
+  if (!["none", "pending", "approved", "changes_requested"].includes(state)) {
+    throw new BusError("INVALID_INPUT", "review_state must be none, pending, approved, or changes_requested");
+  }
+}
+
+function validateTestResultStatus(status: TestResultStatus | undefined): void {
+  if (status === undefined) return;
+  if (!["passed", "failed", "skipped"].includes(status)) {
+    throw new BusError("INVALID_INPUT", "status must be passed, failed, or skipped");
+  }
+}
+
+function validateTaskEventType(eventType: TaskEventType | undefined): void {
+  if (eventType === undefined) return;
+  if (!["note", "phase", "progress", "log", "result", "cancel"].includes(eventType)) {
+    throw new BusError("INVALID_INPUT", "event_type must be note, phase, progress, log, result, or cancel");
+  }
+}
+
+function validateMilestone(milestone: string | null | undefined): void {
+  if (milestone === undefined || milestone === null) return;
+  if (typeof milestone !== "string" || milestone.length === 0 || milestone.length > 120) {
+    throw new BusError("INVALID_INPUT", "milestone must be 1-120 chars or null");
+  }
+}
+
+function validateSessionId(sessionId: string | null | undefined): void {
+  if (sessionId === undefined || sessionId === null) return;
+  if (typeof sessionId !== "string" || sessionId.length === 0 || sessionId.length > 128) {
+    throw new BusError("INVALID_INPUT", "session_id must be 1-128 chars");
+  }
+}
+
+function validateMemoryKind(kind: string): void {
+  if (typeof kind !== "string" || kind.length === 0 || kind.length > 64) {
+    throw new BusError("INVALID_INPUT", "kind must be 1-64 chars");
+  }
+  if (!/^[a-zA-Z0-9_.-]+$/.test(kind)) {
+    throw new BusError("INVALID_INPUT", "kind may only contain letters, digits, _ . -");
+  }
+}
+
+function requireAgent(name: string): Agent {
+  const db = getDb();
+  const row = db.prepare("SELECT * FROM agents WHERE name = ?").get(name) as
+    | AgentRow
+    | undefined;
+  if (!row || row.removed_at !== null) throw new BusError("UNKNOWN_AGENT", `agent '${name}' is not registered`);
+  return toAgent(row);
+}
+
+function validateName(name: string): void {
+  if (typeof name !== "string" || name.length === 0 || name.length > 64) {
+    throw new BusError("INVALID_INPUT", "name must be 1-64 chars");
+  }
+  if (!/^[a-zA-Z0-9_.-]+$/.test(name)) {
+    throw new BusError("INVALID_INPUT", "name may only contain letters, digits, _ . -");
+  }
+}
+
+function validateChannel(channel: string): void {
+  if (typeof channel !== "string" || channel.length === 0 || channel.length > 64) {
+    throw new BusError("INVALID_INPUT", "channel must be 1-64 chars");
+  }
+  if (!/^[a-zA-Z0-9_.:#-]+$/.test(channel)) {
+    throw new BusError(
+      "INVALID_INPUT",
+      "channel may only contain letters, digits, _ . : # -",
+    );
+  }
+}
+
+function newThreadId(): string {
+  const ts = Date.now().toString(36);
+  const rand = Math.random().toString(36).slice(2, 10);
+  return `t_${ts}_${rand}`;
+}
+
+export interface RegisterOptions {
+  name: string;
+  capabilities?: string[];
+  replace?: boolean;
+  project?: string | null;
+  area?: string | null;
+  team?: string | null;
+  role?: AgentRole | null;
+  routing_weight?: number;
+  status?: AgentStatus;
+  session_id?: string | null;
+  bus_version?: string | null;
+}
+
+export interface RegisterScopeSummary {
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  pinned_handoffs: number;
+  pinned_risks: number;
+  open_tasks: number;
+  blocked_tasks: number;
+  recent_decisions_7d: number;
+  recent_memories_7d: number;
+  last_activity_at: number | null;
+}
+
+export interface RegisteredAgent extends Agent {
+  scope_summary?: RegisterScopeSummary;
+  suggested_next_actions?: string[];
+}
+
+function scopeWhere(
+  alias: string,
+  scope: { project?: string | null; area?: string | null; team?: string | null },
+  nullMatches = false,
+): { where: string[]; params: unknown[] } {
+  const where: string[] = [];
+  const params: unknown[] = [];
+  const col = (name: "project" | "area" | "team") => `${alias}.${name}`;
+  if (scope.project !== undefined && scope.project !== null && scope.project !== PROJECT_WILDCARD) {
+    where.push(nullMatches ? `(${col("project")} = ? OR ${col("project")} IS NULL)` : `${col("project")} = ?`);
+    params.push(scope.project);
+  }
+  if (scope.area !== undefined && scope.area !== null && scope.area !== AREA_WILDCARD) {
+    where.push(nullMatches ? `(${col("area")} = ? OR ${col("area")} IS NULL)` : `${col("area")} = ?`);
+    params.push(scope.area);
+  }
+  if (scope.team !== undefined && scope.team !== null && scope.team !== TEAM_WILDCARD) {
+    where.push(`${col("team")} = ?`);
+    params.push(scope.team);
+  }
+  return { where, params };
+}
+
+function countRows(table: "tasks" | "memories" | "decisions", scope: RegisterScopeSummary, extraWhere: string[], extraParams: unknown[], nullMatches = false): number {
+  const scoped = scopeWhere("r", scope, nullMatches);
+  const where = [...scoped.where, ...extraWhere];
+  const row = getDb()
+    .prepare(`SELECT COUNT(*) AS count FROM ${table} r${where.length ? ` WHERE ${where.join(" AND ")}` : ""}`)
+    .get(...scoped.params, ...extraParams) as { count: number };
+  return row.count;
+}
+
+function lastActivityAt(scope: RegisterScopeSummary): number | null {
+  const scoped = scopeWhere("m", scope, true);
+  const where = scoped.where;
+  const row = getDb()
+    .prepare(`SELECT MAX(created_at) AS at FROM messages m${where.length ? ` WHERE ${where.join(" AND ")}` : ""}`)
+    .get(...scoped.params) as { at: number | null };
+  return row.at ?? null;
+}
+
+function buildRegisterScopeSummary(scope: { project: string | null; area: string | null; team: string | null }): RegisterScopeSummary | undefined {
+  if (scope.project === null && scope.area === null && scope.team === null) return undefined;
+  // Keep register cheap: this teaser uses count/max queries only and never
+  // generates a full session brief.
+  const summary: RegisterScopeSummary = {
+    project: scope.project,
+    area: scope.area,
+    team: scope.team,
+    pinned_handoffs: 0,
+    pinned_risks: 0,
+    open_tasks: 0,
+    blocked_tasks: 0,
+    recent_decisions_7d: 0,
+    recent_memories_7d: 0,
+    last_activity_at: null,
+  };
+  const sevenDaysAgo = now() - 7 * 24 * 60 * 60 * 1000;
+  summary.pinned_handoffs = countRows("memories", summary, ["r.kind = 'handoff'", "r.pinned = 1"], [], true);
+  summary.pinned_risks = countRows("memories", summary, ["r.kind = 'risk'", "r.pinned = 1"], [], true);
+  summary.open_tasks = countRows("tasks", summary, ["r.state = 'open'"], [], false);
+  summary.blocked_tasks = countRows("tasks", summary, ["r.state = 'blocked'"], [], false);
+  summary.recent_decisions_7d = countRows("decisions", summary, ["r.created_at >= ?"], [sevenDaysAgo], true);
+  summary.recent_memories_7d = countRows("memories", summary, ["r.created_at >= ?"], [sevenDaysAgo], true);
+  summary.last_activity_at = lastActivityAt(summary);
+  const total =
+    summary.pinned_handoffs +
+    summary.pinned_risks +
+    summary.open_tasks +
+    summary.blocked_tasks +
+    summary.recent_decisions_7d +
+    summary.recent_memories_7d +
+    (summary.last_activity_at === null ? 0 : 1);
+  return total > 0 ? summary : undefined;
+}
+
+function registerSuggestedNextActions(summary: RegisterScopeSummary | undefined): string[] | undefined {
+  if (summary === undefined) return undefined;
+  const actions: string[] = [];
+  if (summary.pinned_handoffs > 0) actions.push(`Read session_brief before taking work; ${summary.pinned_handoffs} pinned handoff(s) exist.`);
+  if (summary.pinned_risks > 0) actions.push(`Review pinned risks before editing; ${summary.pinned_risks} risk memory item(s) exist.`);
+  if (summary.blocked_tasks > 0) actions.push(`Inspect blocked tasks before claiming new work; ${summary.blocked_tasks} blocked task(s) exist.`);
+  if (summary.open_tasks > 0) actions.push(`Use claim_best_task or ask the PM before starting; ${summary.open_tasks} open task(s) exist.`);
+  if (actions.length === 0 && (summary.recent_decisions_7d > 0 || summary.recent_memories_7d > 0)) {
+    actions.push("Read session_brief for recent decisions and memories before taking work.");
+  }
+  return actions.length > 0 ? actions : undefined;
+}
+
+export function register(opts: RegisterOptions): RegisteredAgent {
+  const compatibility = legacyCore("register", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.name);
+  validateProject(opts.project);
+  validateArea(opts.area);
+  validateTeam(opts.team);
+  validateRole(opts.role);
+  validateAgentStatus(opts.status);
+  validateSessionId(opts.session_id);
+  if (opts.bus_version !== undefined && opts.bus_version !== null && (opts.bus_version.length === 0 || opts.bus_version.length > 64)) {
+    throw new BusError("INVALID_INPUT", "bus_version must be 1-64 chars or omitted");
+  }
+  if (opts.routing_weight !== undefined && !Number.isFinite(opts.routing_weight)) {
+    throw new BusError("INVALID_INPUT", "routing_weight must be a number");
+  }
+  const caps = opts.capabilities ?? [];
+  const db = getDb();
+  const existing = db
+    .prepare("SELECT * FROM agents WHERE name = ?")
+    .get(opts.name) as AgentRow | undefined;
+
+  const ts = now();
+  if (existing && existing.removed_at === null && !opts.replace) {
+    const ageMs = ts - existing.last_seen;
+    if (ageMs < 60_000) {
+      throw new BusError(
+        "NAME_TAKEN",
+        `agent '${opts.name}' is active (last seen ${Math.round(ageMs / 1000)}s ago); pass replace:true to take over`,
+      );
+    }
+  }
+
+  const project = opts.project ?? null;
+  const area = opts.area ?? null;
+  const team = opts.team ?? null;
+  const role = opts.role ?? null;
+  const routingWeight = Math.trunc(opts.routing_weight ?? 0);
+  const status = opts.status ?? "idle";
+  const sessionId = opts.session_id ?? null;
+  const busVersion = opts.bus_version ?? null;
+  db.prepare(
+    `INSERT INTO agents (name, capabilities, registered_at, last_seen, paused, project, area, team, role, routing_weight, status, session_id, removed_at, bus_version, listening_until)
+       VALUES (@name, @capabilities, @ts, @ts, 0, @project, @area, @team, @role, @routingWeight, @status, @sessionId, NULL, @busVersion, NULL)
+     ON CONFLICT(name) DO UPDATE SET
+       capabilities = excluded.capabilities,
+       registered_at = excluded.registered_at,
+       last_seen = excluded.last_seen,
+       paused = 0,
+       project = excluded.project,
+       area = excluded.area,
+       team = excluded.team,
+       role = excluded.role,
+       routing_weight = excluded.routing_weight,
+       status = excluded.status,
+       session_id = excluded.session_id,
+       bus_version = excluded.bus_version,
+       listening_until = NULL,
+       removed_at = NULL`,
+  ).run({ name: opts.name, capabilities: JSON.stringify(caps), ts, project, area, team, role, routingWeight, status, sessionId, busVersion });
+
+  const agent = requireAgent(opts.name) as RegisteredAgent;
+  notifyPendingAssignments(agent.name);
+  const summary = buildRegisterScopeSummary({ project, area, team });
+  const suggested = registerSuggestedNextActions(summary);
+  if (summary !== undefined) agent.scope_summary = summary;
+  if (suggested !== undefined) agent.suggested_next_actions = suggested;
+  return agent;
+}
+
+function notifyPendingAssignments(name: string): void {
+  const rows = getDb()
+    .prepare("SELECT * FROM tasks WHERE pending_assignee = ? AND state = 'open' ORDER BY priority DESC, created_at ASC LIMIT 50")
+    .all(name) as TaskRow[];
+  for (const row of rows) {
+    send({
+      from: row.requested_by,
+      to: name,
+      content: `pending assignment task #${row.id}: ${row.title}. Claim with claim_task then acknowledge_task.`,
+      thread_id: row.thread_id,
+    });
+  }
+}
+
+export function heartbeat(name: string): void {
+  const compatibility = legacyCore('set_agent_status', {agent:name});
+  if (compatibility.handled) return compatibility.value;
+  const db = getDb();
+  db.prepare("UPDATE agents SET last_seen = ? WHERE name = ? AND removed_at IS NULL").run(now(), name);
+}
+
+function markAgentListening(name: string, listeningUntil: number): void {
+  const ts = now();
+  const boundedListeningUntil = Math.min(listeningUntil, ts + LISTENING_HORIZON_MS);
+  getDb()
+    .prepare("UPDATE agents SET last_seen = ?, listening_until = ? WHERE name = ? AND removed_at IS NULL")
+    .run(ts, boundedListeningUntil, name);
+}
+
+export interface WhoisOptions {
+  project?: string;
+  area?: string;
+  team?: string;
+}
+
+export function whois(opts: WhoisOptions = {}): Agent[] {
+  const compatibility = legacyCore("whois", opts);
+  if (compatibility.handled) return compatibility.value;
+  const db = getDb();
+  const where: string[] = ["removed_at IS NULL"];
+  const params: unknown[] = [];
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    validateProject(opts.project);
+    where.push("(project = ? OR project IS NULL)");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    validateArea(opts.area);
+    where.push("(area = ? OR area IS NULL)");
+    params.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) {
+    validateTeam(opts.team);
+    where.push("team = ?");
+    params.push(opts.team);
+  }
+  const rows = db
+    .prepare(
+      `SELECT * FROM agents${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY last_seen DESC`,
+    )
+    .all(...params) as AgentRow[];
+  return rows.map(toAgent);
+}
+
+export interface AgentDirectoryEntry extends Agent {
+  presence: "online" | "idle" | "stale" | "paused";
+  age_s: number;
+  listening: boolean;
+  active_task_id: number | null;
+}
+
+export function directory(opts: WhoisOptions = {}): AgentDirectoryEntry[] {
+  const compatibility = legacyCore("directory", opts);
+  if (compatibility.handled) return compatibility.value;
+  const agents = whois(opts);
+  const db = getDb();
+  const activeRows = db
+    .prepare(
+      `SELECT claimed_by, id
+         FROM tasks
+        WHERE claimed_by IS NOT NULL
+          AND state IN ('claimed','working','blocked')
+        ORDER BY updated_at DESC`,
+    )
+    .all() as { claimed_by: string; id: number }[];
+  const activeByAgent = new Map<string, number>();
+  for (const row of activeRows) {
+    if (!activeByAgent.has(row.claimed_by)) activeByAgent.set(row.claimed_by, row.id);
+  }
+  const ts = now();
+  return agents.map((agent) => {
+    const age_s = Math.max(0, Math.round((ts - agent.last_seen) / 1000));
+    const listening = agent.listening_until !== null && agent.listening_until > ts && !agent.paused;
+    const presence =
+      agent.paused
+        ? "paused"
+        : age_s < 60
+          ? "online"
+          : age_s < 300
+            ? "idle"
+            : "stale";
+    return {
+      ...agent,
+      presence,
+      age_s,
+      listening,
+      active_task_id: activeByAgent.get(agent.name) ?? null,
+    };
+  });
+}
+
+export interface WaitForAgentsOptions extends WhoisOptions {
+  names: string[];
+  timeout_s?: number;
+}
+
+export interface WaitForAgentsResult {
+  ready: AgentDirectoryEntry[];
+  missing: string[];
+  stale: AgentDirectoryEntry[];
+  wrong_scope: Array<{
+    name: string;
+    project: string | null;
+    area: string | null;
+    team: string | null;
+    expected_project: string | null;
+    expected_area: string | null;
+    expected_team: string | null;
+  }>;
+}
+
+export async function waitForAgents(opts: WaitForAgentsOptions): Promise<WaitForAgentsResult> {
+  const compatibility = legacyCore("wait_for_agents", opts);
+  if (compatibility.handled) return compatibility.value;
+  if (!Array.isArray(opts.names) || opts.names.length === 0) {
+    throw new BusError("INVALID_INPUT", "names must be a non-empty array");
+  }
+  for (const name of opts.names) validateName(name);
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) validateProject(opts.project);
+  validateArea(opts.area);
+  validateTeam(opts.team);
+  const timeout = Math.min(Math.max(opts.timeout_s ?? 60, 0), MAX_INBOX_WAIT_S);
+  const deadline = now() + timeout * 1000;
+  let latest = inspectAgents(opts);
+  while ((latest.missing.length > 0 || latest.stale.length > 0 || latest.wrong_scope.length > 0) && now() < deadline) {
+    await sleep(POLL_INTERVAL_MS);
+    latest = inspectAgents(opts);
+  }
+  return latest;
+}
+
+function inspectAgents(opts: WaitForAgentsOptions): WaitForAgentsResult {
+  const expected = new Set(opts.names);
+  const all = directory({ project: PROJECT_WILDCARD, area: AREA_WILDCARD, team: TEAM_WILDCARD }).filter((agent) => expected.has(agent.name));
+  const byName = new Map(all.map((agent) => [agent.name, agent]));
+  const missing = opts.names.filter((name) => !byName.has(name));
+  const wrong_scope: WaitForAgentsResult["wrong_scope"] = [];
+  const stale: AgentDirectoryEntry[] = [];
+  const ready: AgentDirectoryEntry[] = [];
+  for (const agent of all) {
+    const projectWrong = opts.project !== undefined && opts.project !== PROJECT_WILDCARD && agent.project !== opts.project;
+    const areaWrong = opts.area !== undefined && opts.area !== AREA_WILDCARD && agent.area !== opts.area;
+    const teamWrong = opts.team !== undefined && opts.team !== TEAM_WILDCARD && agent.team !== opts.team;
+    if (projectWrong || areaWrong || teamWrong) {
+      wrong_scope.push({
+        name: agent.name,
+        project: agent.project,
+        area: agent.area,
+        team: agent.team,
+        expected_project: opts.project === undefined || opts.project === PROJECT_WILDCARD ? null : opts.project,
+        expected_area: opts.area === undefined || opts.area === AREA_WILDCARD ? null : opts.area,
+        expected_team: opts.team === undefined || opts.team === TEAM_WILDCARD ? null : opts.team,
+      });
+    } else if (agent.presence === "stale" || agent.presence === "paused") {
+      stale.push(agent);
+    } else {
+      ready.push(agent);
+    }
+  }
+  return { ready, missing, stale, wrong_scope };
+}
+
+export interface SendOptions {
+  from: string;
+  to: string;
+  content: string;
+  kind?: MessageKind;
+  reply_to?: number;
+  thread_id?: string;
+  channel?: string | null;
+  priority?: MessagePriority;
+}
+
+function insertMessage(
+  opts: SendOptions,
+  threadId: string,
+  senderProject: string | null,
+  senderArea: string | null,
+  senderTeam: string | null,
+): Message {
+  validatePriority(opts.priority);
+  const db = getDb();
+  const ts = now();
+  const priority = opts.priority ?? "normal";
+  const info = db
+    .prepare(
+      `INSERT INTO messages
+         (from_agent, to_agent, kind, content, reply_to, status, created_at, thread_id, channel, project, area, team, priority)
+       VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      opts.from,
+      opts.to,
+      opts.kind ?? "msg",
+      opts.content,
+      opts.reply_to ?? null,
+      ts,
+      threadId,
+      opts.channel ?? null,
+      senderProject,
+      senderArea,
+      senderTeam,
+      priority,
+    );
+
+  const row = db
+    .prepare("SELECT * FROM messages WHERE id = ?")
+    .get(info.lastInsertRowid as number) as MessageRow;
+  const message = toMessage(row);
+  runLocalHook("message.created", message);
+  return message;
+}
+
+export function send(opts: SendOptions): Message {
+  const compatibility = legacyCore("send", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.from);
+  validateName(opts.to);
+  if (typeof opts.content !== "string") {
+    throw new BusError("INVALID_INPUT", "content must be a string");
+  }
+  const sender = requireAgent(opts.from);
+  requireAgent(opts.to);
+  heartbeat(opts.from);
+  const threadId = opts.thread_id ?? inferTaskThreadId(opts.content, opts.from, opts.to) ?? newThreadId();
+  return insertMessage({ ...opts, thread_id: threadId }, threadId, sender.project, sender.area, sender.team);
+}
+
+function inferTaskThreadId(content: string, from: string, to: string): string | null {
+  const match = content.match(/\btask\s*#(\d+)\b/i) ?? content.match(/#(\d+)\b/);
+  if (!match?.[1]) return null;
+  const id = Number(match[1]);
+  if (!Number.isInteger(id) || id <= 0) return null;
+  const row = getDb()
+    .prepare("SELECT * FROM tasks WHERE id = ?")
+    .get(id) as TaskRow | undefined;
+  if (!row) return null;
+  const participants = [row.requested_by, row.claimed_by, row.pending_assignee].filter(Boolean);
+  if (!participants.includes(from) && !participants.includes(to)) return null;
+  return row.thread_id;
+}
+
+export interface InboxOptions {
+  agent: string;
+  project?: string;
+  area?: string;
+  team?: string;
+  thread_id?: string;
+  since_id?: number;
+  mark_delivered?: boolean;
+  limit?: number;
+  wait_s?: number;
+  claim_s?: number;
+}
+
+export interface InboxPreviewOptions {
+  agent: string;
+  project?: string;
+  area?: string;
+  team?: string;
+  thread_id?: string;
+  since_id?: number;
+  limit?: number;
+  wait_s?: number;
+  preview_chars?: number;
+}
+
+export async function inbox(opts: InboxOptions): Promise<Message[]> {
+  const compatibility = legacyCore("inbox", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  validateProject(opts.project);
+  validateArea(opts.area);
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) validateTeam(opts.team);
+  const agent = requireAgent(opts.agent);
+  heartbeat(opts.agent);
+  if (agent.paused) return [];
+
+  const immediate = readInbox(opts);
+  if (immediate.length > 0 || !opts.wait_s) return immediate;
+
+  const waitMs = Math.min(opts.wait_s, MAX_INBOX_WAIT_S) * 1000;
+  const deadline = now() + waitMs;
+  markAgentListening(opts.agent, deadline);
+  while (now() < deadline) {
+    await sleep(POLL_INTERVAL_MS);
+    markAgentListening(opts.agent, deadline);
+    const fresh = readInbox(opts);
+    if (fresh.length > 0) return fresh;
+  }
+  return [];
+}
+
+export async function inboxPreviews(opts: InboxPreviewOptions): Promise<MessagePreview[]> {
+  const compatibility = legacyCore("inbox_previews", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  validateProject(opts.project);
+  validateArea(opts.area);
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) validateTeam(opts.team);
+  const agent = requireAgent(opts.agent);
+  heartbeat(opts.agent);
+  if (agent.paused) return [];
+
+  const immediate = readInboxPreviews(opts);
+  if (immediate.length > 0 || !opts.wait_s) return immediate;
+
+  const waitMs = Math.min(opts.wait_s, MAX_INBOX_WAIT_S) * 1000;
+  const deadline = now() + waitMs;
+  markAgentListening(opts.agent, deadline);
+  while (now() < deadline) {
+    await sleep(POLL_INTERVAL_MS);
+    markAgentListening(opts.agent, deadline);
+    const fresh = readInboxPreviews(opts);
+    if (fresh.length > 0) return fresh;
+  }
+  return [];
+}
+
+function readInbox(opts: InboxOptions): Message[] {
+  const db = getDb();
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
+  const since = opts.since_id ?? 0;
+  const ts = now();
+  const teamFilter = opts.team !== undefined && opts.team !== TEAM_WILDCARD ? opts.team : null;
+  const where = [
+    "to_agent = ?",
+    "id > ?",
+    "status = 'pending'",
+    "(claim_deadline IS NULL OR claim_deadline < ?)",
+  ];
+  const params: unknown[] = [opts.agent, since, ts];
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    where.push("project = ?");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    where.push("area = ?");
+    params.push(opts.area);
+  }
+  if (teamFilter !== null) {
+    where.push("team = ?");
+    params.push(teamFilter);
+  }
+  if (opts.thread_id !== undefined) {
+    where.push("thread_id = ?");
+    params.push(opts.thread_id);
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT * FROM messages
+         WHERE ${where.join("\n           AND ")}
+         ORDER BY CASE priority
+           WHEN 'urgent' THEN 3
+           WHEN 'high' THEN 2
+           WHEN 'normal' THEN 1
+           ELSE 0
+         END DESC, id ASC
+         LIMIT ?`,
+    )
+    .all(...params, limit) as MessageRow[];
+
+  if (rows.length === 0) return [];
+
+  const ids = rows.map((r) => r.id);
+  const placeholders = ids.map(() => "?").join(",");
+
+  if (opts.claim_s && opts.claim_s > 0) {
+    const claimDeadline = ts + opts.claim_s * 1000;
+    db.prepare(
+      `UPDATE messages
+         SET claim_deadline = ?, claimed_by = ?
+         WHERE id IN (${placeholders})`,
+    ).run(claimDeadline, opts.agent, ...ids);
+    for (const row of rows) {
+      row.claim_deadline = claimDeadline;
+      row.claimed_by = opts.agent;
+    }
+  } else if (opts.mark_delivered !== false) {
+    db.prepare(
+      `UPDATE messages
+         SET status = 'delivered', delivered_at = ?
+         WHERE id IN (${placeholders}) AND status = 'pending'`,
+    ).run(ts, ...ids);
+    for (const row of rows) {
+      row.status = "delivered";
+      row.delivered_at = ts;
+    }
+  }
+
+  return rows.map(toMessage);
+}
+
+function readInboxPreviews(opts: InboxPreviewOptions): MessagePreview[] {
+  const db = getDb();
+  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
+  const since = opts.since_id ?? 0;
+  const ts = now();
+  const teamFilter = opts.team !== undefined && opts.team !== TEAM_WILDCARD ? opts.team : null;
+  const where = [
+    "to_agent = ?",
+    "id > ?",
+    "status = 'pending'",
+    "(claim_deadline IS NULL OR claim_deadline < ?)",
+  ];
+  const params: unknown[] = [opts.agent, since, ts];
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    where.push("project = ?");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    where.push("area = ?");
+    params.push(opts.area);
+  }
+  if (teamFilter !== null) {
+    where.push("team = ?");
+    params.push(teamFilter);
+  }
+  if (opts.thread_id !== undefined) {
+    where.push("thread_id = ?");
+    params.push(opts.thread_id);
+  }
+  const rows = db
+    .prepare(
+      `SELECT * FROM messages
+         WHERE ${where.join("\n           AND ")}
+         ORDER BY CASE priority
+           WHEN 'urgent' THEN 3
+           WHEN 'high' THEN 2
+           WHEN 'normal' THEN 1
+           ELSE 0
+         END DESC, id ASC
+         LIMIT ?`,
+    )
+    .all(...params, limit) as MessageRow[];
+  return rows.map((row) => toMessagePreview(row, opts.preview_chars));
+}
+
+export interface GetMessageOptions {
+  message_id: number;
+  preview_chars?: number;
+  include_content?: boolean;
+  project?: string;
+  area?: string;
+  team?: string;
+}
+
+export interface GetMessageResult {
+  message: Message | MessagePreview;
+  full_content_included: boolean;
+  suggested_next_actions: string[];
+}
+
+export function getMessage(opts: GetMessageOptions): GetMessageResult {
+  const compatibility = legacyCore("get_message", opts);
+  if (compatibility.handled) return compatibility.value;
+  const row = getMessageRow(opts.message_id);
+  assertMessageInScope(row, {
+    project: opts.project,
+    area: opts.area,
+    team: opts.team,
+  });
+  const previewOnly = opts.include_content === false || opts.preview_chars !== undefined;
+  const message = previewOnly ? toMessagePreview(row, opts.preview_chars) : toMessage(row);
+  return {
+    message,
+    full_content_included: !previewOnly,
+    suggested_next_actions: [
+      row.kind === "ask"
+        ? `answer with reply(from=<you>, ask_id=${row.id}, answer=...)`
+        : `this is kind=${row.kind}; continue the conversation with reply_thread(thread_id="${row.thread_id ?? ""}", ...) or send(..., thread_id="${row.thread_id ?? ""}")`,
+      row.thread_id ? `read related context with thread(thread_id="${row.thread_id}")` : "message has no thread id",
+    ],
+  };
+}
+
+function assertMessageInScope(
+  row: MessageRow,
+  scope: { project?: string; area?: string; team?: string },
+): void {
+  validateProject(scope.project);
+  validateArea(scope.area);
+  validateTeam(scope.team);
+  const mismatches: string[] = [];
+  if (scope.project !== undefined && scope.project !== PROJECT_WILDCARD && row.project !== scope.project) {
+    mismatches.push(`project=${row.project ?? "none"}`);
+  }
+  if (scope.area !== undefined && scope.area !== AREA_WILDCARD && row.area !== scope.area) {
+    mismatches.push(`area=${row.area ?? "none"}`);
+  }
+  if (scope.team !== undefined && scope.team !== TEAM_WILDCARD && row.team !== scope.team) {
+    mismatches.push(`team=${row.team ?? "none"}`);
+  }
+  if (mismatches.length > 0) {
+    const expected = [
+      scope.project !== undefined && scope.project !== PROJECT_WILDCARD ? `project=${scope.project}` : null,
+      scope.area !== undefined && scope.area !== AREA_WILDCARD ? `area=${scope.area}` : null,
+      scope.team !== undefined && scope.team !== TEAM_WILDCARD ? `team=${scope.team}` : null,
+    ].filter(Boolean).join(", ");
+    throw new BusError(
+      "MESSAGE_NOT_FOUND",
+      `message ${row.id} is outside requested scope (${expected}); actual ${mismatches.join(", ")}`,
+    );
+  }
+}
+
+export interface AckOptions {
+  agent: string;
+  message_id: number;
+}
+
+export function ack(opts: AckOptions): Message {
+  const compatibility = legacyCore("ack", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  requireAgent(opts.agent);
+
+  const db = getDb();
+  const row = getMessageRow(opts.message_id);
+  if (row.to_agent !== opts.agent) {
+    throw new BusError(
+      "INVALID_INPUT",
+      `message ${opts.message_id} is addressed to '${row.to_agent}', not '${opts.agent}'`,
+    );
+  }
+
+  const ts = now();
+  db.prepare(
+    `UPDATE messages
+       SET status = 'delivered', delivered_at = ?, claim_deadline = NULL, claimed_by = NULL
+       WHERE id = ? AND status = 'pending'`,
+  ).run(ts, opts.message_id);
+
+  const updated = db
+    .prepare("SELECT * FROM messages WHERE id = ?")
+    .get(opts.message_id) as MessageRow;
+  return toMessage(updated);
+}
+
+export interface InboxStatusOptions {
+  agent: string;
+  project?: string;
+  area?: string;
+  team?: string;
+  thread_id?: string;
+  since_id?: number;
+  limit?: number;
+}
+
+export interface InboxStatus {
+  agent: string;
+  unread: Message[];
+  in_flight: Message[];
+  delivered_recent: Message[];
+  last_message: Message | null;
+  next_claim_deadline: number | null;
+  summary: string;
+}
+
+export function inboxStatus(opts: InboxStatusOptions): InboxStatus {
+  const compatibility = legacyCore("inbox_status", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  validateProject(opts.project);
+  validateArea(opts.area);
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) validateTeam(opts.team);
+  requireAgent(opts.agent);
+  heartbeat(opts.agent);
+  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
+  const ts = now();
+  const filters: string[] = [];
+  const filterParams: unknown[] = [];
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    filters.push("project = ?");
+    filterParams.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    filters.push("area = ?");
+    filterParams.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) {
+    filters.push("team = ?");
+    filterParams.push(opts.team);
+  }
+  if (opts.thread_id !== undefined) {
+    filters.push("thread_id = ?");
+    filterParams.push(opts.thread_id);
+  }
+  if (opts.since_id !== undefined) {
+    filters.push("id > ?");
+    filterParams.push(opts.since_id);
+  }
+  const filterWhere = filters.length === 0 ? "" : ` AND ${filters.join(" AND ")}`;
+  const unreadParams = [opts.agent, ts, ...filterParams, limit];
+  const deliveredParams = [opts.agent, ...filterParams, limit];
+  const lastParams = [opts.agent, ...filterParams];
+  const unread = getDb()
+    .prepare(
+      `SELECT * FROM messages
+        WHERE to_agent = ?
+          AND status = 'pending'
+          AND (claim_deadline IS NULL OR claim_deadline < ?)
+          ${filterWhere}
+        ORDER BY id ASC
+        LIMIT ?`,
+    )
+    .all(...unreadParams) as MessageRow[];
+  const inFlight = getDb()
+    .prepare(
+      `SELECT * FROM messages
+        WHERE to_agent = ?
+          AND status = 'pending'
+          AND claim_deadline IS NOT NULL
+          AND claim_deadline >= ?
+          ${filterWhere}
+        ORDER BY claim_deadline ASC, id ASC
+        LIMIT ?`,
+    )
+    .all(...unreadParams) as MessageRow[];
+  const delivered = getDb()
+    .prepare(
+      `SELECT * FROM messages
+        WHERE to_agent = ?
+          AND status IN ('delivered','answered')
+          ${filterWhere}
+        ORDER BY id DESC
+        LIMIT ?`,
+    )
+    .all(...deliveredParams) as MessageRow[];
+  const last = getDb()
+    .prepare(`SELECT * FROM messages WHERE to_agent = ?${filterWhere} ORDER BY id DESC LIMIT 1`)
+    .get(...lastParams) as MessageRow | undefined;
+  const nextClaim = inFlight.reduce<number | null>(
+    (best, row) => row.claim_deadline !== null && (best === null || row.claim_deadline < best) ? row.claim_deadline : best,
+    null,
+  );
+  const summary =
+    unread.length > 0
+      ? `${unread.length} unread message(s)`
+      : inFlight.length > 0
+        ? `no unread messages; ${inFlight.length} message(s) currently claimed/in-flight`
+        : delivered.length > 0
+          ? `no unread messages; ${delivered.length} recent delivered/answered message(s), last message #${last?.id ?? delivered[0]?.id} was ${last?.status ?? delivered[0]?.status}`
+        : last
+          ? `no unread messages; last message #${last.id} was ${last.status}`
+          : "no messages for this agent";
+  return {
+    agent: opts.agent,
+    unread: unread.map(toMessage),
+    in_flight: inFlight.map(toMessage),
+    delivered_recent: delivered.reverse().map(toMessage),
+    last_message: last ? toMessage(last) : null,
+    next_claim_deadline: nextClaim,
+    summary,
+  };
+}
+
+export interface AskOptions {
+  from: string;
+  to: string;
+  question: string;
+  timeout_s?: number;
+  thread_id?: string;
+}
+
+interface BlockingAskInfo {
+  id: number;
+  status: MessageStatus;
+  age_s: number;
+  thread_id: string | null;
+  claim_deadline: number | null;
+  claimed_by: string | null;
+}
+
+function activeOppositeAsk(from: string, to: string): BlockingAskInfo | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT * FROM messages
+         WHERE kind = 'ask'
+           AND from_agent = ?
+           AND to_agent = ?
+           AND status != 'answered'
+         ORDER BY id DESC
+         LIMIT 1`,
+    )
+    .get(from, to) as MessageRow | undefined;
+  if (!row) return null;
+  const ts = now();
+  const ageMs = Math.max(0, ts - row.created_at);
+  const claimActive = row.claim_deadline !== null && row.claim_deadline >= ts;
+  const withinActiveAskWindow = ageMs <= ACTIVE_ASK_CYCLE_WINDOW_MS;
+  if (!claimActive && !withinActiveAskWindow) return null;
+  return {
+    id: row.id,
+    status: row.status,
+    age_s: Math.floor(ageMs / 1000),
+    thread_id: row.thread_id,
+    claim_deadline: row.claim_deadline,
+    claimed_by: row.claimed_by,
+  };
+}
+
+async function askWithScope(
+  opts: AskOptions,
+  scope?: { project: string | null; area: string | null; team: string | null },
+): Promise<Message> {
+  const timeout_s = Math.min(opts.timeout_s ?? 60, MAX_ASK_TIMEOUT_S);
+  const { asked } = createAskMessage(opts, scope, { failIfUnavailable: true });
+
+  const deadline = now() + timeout_s * 1000;
+  const db = getDb();
+  const stmt = db.prepare(
+    `SELECT * FROM messages WHERE reply_to = ? AND kind = 'reply' LIMIT 1`,
+  );
+
+  while (now() < deadline) {
+    const reply = stmt.get(asked.id) as MessageRow | undefined;
+    if (reply) return toMessage(reply);
+    await sleep(POLL_INTERVAL_MS);
+  }
+
+  throw new BusError(
+    "ASK_TIMEOUT",
+    `no reply from '${opts.to}' within ${timeout_s}s (ask_id=${asked.id}); ask remains pending, use message_status(${asked.id}) or inbox_status(${opts.from}) later`,
+  );
+}
+
+export interface AskAsyncResult {
+  ask: Message;
+  recipient: AgentDirectoryEntry | null;
+  suggested_next_actions: string[];
+}
+
+export function askAsync(opts: AskOptions): AskAsyncResult {
+  const compatibility = legacyCore("ask_async", opts);
+  if (compatibility.handled) return compatibility.value;
+  return askAsyncWithScope(opts);
+}
+
+function askAsyncWithScope(
+  opts: AskOptions,
+  scope?: { project: string | null; area: string | null; team: string | null },
+): AskAsyncResult {
+  const { asked, recipient } = createAskMessage(opts, scope, { failIfUnavailable: false });
+  const suggested = [
+    `ask #${asked.id} is pending; keep working and check inbox_status(${opts.from}) later`,
+    `recipient ${opts.to} is ${recipient ? `${recipient.status}/${recipient.presence}${recipient.listening ? "/listening" : "/not-listening"}, seen ${recipient.age_s}s ago` : "not in directory"}`,
+    `use message_status(${asked.id}) or why_no_reply(${asked.id}) for diagnostics`,
+  ];
+  if (recipient?.presence === "stale" || recipient?.presence === "paused") {
+    suggested.unshift(`recipient is ${recipient.presence}; wake/start ${opts.to} or delegate tracked work instead`);
+  }
+  return { ask: asked, recipient, suggested_next_actions: suggested };
+}
+
+function createAskMessage(
+  opts: AskOptions,
+  scope: { project: string | null; area: string | null; team: string | null } | undefined,
+  options: { failIfUnavailable: boolean },
+): { asked: Message; recipient: AgentDirectoryEntry | null } {
+  const sender = requireAgent(opts.from);
+  requireAgent(opts.to);
+
+  const oppositeAsk = activeOppositeAsk(opts.to, opts.from);
+  if (oppositeAsk !== null) {
+    const threadPart = oppositeAsk.thread_id ? ` thread=${oppositeAsk.thread_id}` : "";
+    const claimPart = oppositeAsk.claim_deadline !== null
+      ? ` claimed_by=${oppositeAsk.claimed_by ?? "unknown"} until=${oppositeAsk.claim_deadline}`
+      : "";
+    throw new BusError(
+      "ASK_CYCLE",
+      `'${opts.to}' already has active ask #${oppositeAsk.id} to '${opts.from}' (status=${oppositeAsk.status}, age=${oppositeAsk.age_s}s${threadPart}${claimPart}); answer it first, inspect message_status(${oppositeAsk.id}), or use ask_async/send for non-blocking work`,
+    );
+  }
+
+  const recipient = directory({ project: PROJECT_WILDCARD, area: AREA_WILDCARD, team: TEAM_WILDCARD })
+    .find((agent) => agent.name === opts.to) ?? null;
+  if (options.failIfUnavailable && (recipient?.presence === "paused" || recipient?.presence === "stale")) {
+    throw new BusError(
+      "ASK_RECIPIENT_UNAVAILABLE",
+      `'${opts.to}' is ${recipient.presence}, seen ${recipient.age_s}s ago; use ask_async, send, delegate, or wake/start the agent instead of blocking ask`,
+    );
+  }
+
+  heartbeat(opts.from);
+  const threadId = opts.thread_id ?? inferTaskThreadId(opts.question, opts.from, opts.to) ?? newThreadId();
+  const asked = insertMessage(
+    {
+      from: opts.from,
+      to: opts.to,
+      content: opts.question,
+      kind: "ask",
+      thread_id: threadId,
+    },
+    threadId,
+    scope?.project ?? sender.project,
+    scope?.area ?? sender.area,
+    scope?.team ?? sender.team,
+  );
+  return { asked, recipient };
+}
+
+export async function ask(opts: AskOptions): Promise<Message> {
+  const compatibility = legacyCore("ask", opts);
+  if (compatibility.handled) return compatibility.value;
+  return askWithScope(opts);
+}
+
+export interface ReplyOptions {
+  from: string;
+  ask_id: number;
+  answer: string;
+}
+
+export function reply(opts: ReplyOptions): Message {
+  const compatibility = legacyCore("reply", opts);
+  if (compatibility.handled) return compatibility.value;
+  const db = getDb();
+  const askRow = db
+    .prepare("SELECT * FROM messages WHERE id = ? AND kind = 'ask'")
+    .get(opts.ask_id) as MessageRow | undefined;
+  if (!askRow) {
+    const row = db.prepare("SELECT * FROM messages WHERE id = ?").get(opts.ask_id) as MessageRow | undefined;
+    if (!row) {
+      throw new BusError("ASK_NOT_FOUND", `no message with id ${opts.ask_id}; check inbox_previews or get_message for the correct id`);
+    }
+    if (row.to_agent !== opts.from && row.from_agent !== opts.from) {
+      throw new BusError(
+        "INVALID_INPUT",
+        `message ${opts.ask_id} is between '${row.from_agent}' and '${row.to_agent}', so '${opts.from}' cannot reply to it`,
+      );
+    }
+    if (row.thread_id === null) {
+      const target = row.from_agent === opts.from ? row.to_agent : row.from_agent;
+      return send({ from: opts.from, to: target, content: opts.answer, kind: "reply", reply_to: row.id });
+    }
+    return replyThread({ from: opts.from, thread_id: row.thread_id, message: opts.answer });
+  }
+  if (askRow.to_agent !== opts.from) {
+    throw new BusError(
+      "INVALID_INPUT",
+      `ask ${opts.ask_id} is addressed to '${askRow.to_agent}', not '${opts.from}'`,
+    );
+  }
+
+  const threadId = askRow.thread_id ?? newThreadId();
+  const replier = requireAgent(opts.from);
+  const replyMsg = insertMessage(
+    {
+      from: opts.from,
+      to: askRow.from_agent,
+      content: opts.answer,
+      kind: "reply",
+      reply_to: askRow.id,
+      thread_id: threadId,
+    },
+    threadId,
+    replier.project,
+    replier.area,
+    replier.team,
+  );
+  heartbeat(opts.from);
+
+  db.prepare(
+    "UPDATE messages SET status = 'answered', replied_at = ? WHERE id = ?",
+  ).run(now(), askRow.id);
+
+  return replyMsg;
+}
+
+export interface ReplyThreadOptions {
+  from: string;
+  thread_id: string;
+  message: string;
+}
+
+export function replyThread(opts: ReplyThreadOptions): Message {
+  const compatibility = legacyCore("reply_thread", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.from);
+  requireAgent(opts.from);
+  if (typeof opts.thread_id !== "string" || opts.thread_id.length === 0) {
+    throw new BusError("INVALID_INPUT", "thread_id is required");
+  }
+  if (typeof opts.message !== "string") {
+    throw new BusError("INVALID_INPUT", "message must be a string");
+  }
+  const rows = threadMessages(opts.thread_id, 500);
+  if (rows.length === 0) {
+    throw new BusError("THREAD_NOT_FOUND", `no messages in thread '${opts.thread_id}'`);
+  }
+  const target = [...rows]
+    .reverse()
+    .find((message) => message.from_agent !== opts.from && message.to_agent === opts.from)?.from_agent
+    ?? [...rows].reverse().find((message) => message.from_agent !== opts.from)?.from_agent;
+  if (!target) {
+    throw new BusError("UNKNOWN_AGENT", `could not infer another participant in thread '${opts.thread_id}'`);
+  }
+  // Make this a real threaded reply: kind='reply' and reply_to = the thread
+  // root (oldest message), so replies group Slack-style under one root and
+  // light up replies_count/has_replies + the cockpit's "N replies" thread view.
+  // (rows is ordered oldest-first and is non-empty here.)
+  const root = rows[0]!;
+  return send({
+    from: opts.from,
+    to: target,
+    content: opts.message,
+    thread_id: opts.thread_id,
+    kind: "reply",
+    reply_to: root.id,
+  });
+}
+
+export interface MessageStatusOptions {
+  message_id: number;
+}
+
+export interface MessageStatusResult {
+  message: Message;
+  reply: Message | null;
+  recipient: AgentDirectoryEntry | null;
+  related_task: Task | null;
+  diagnostics: string[];
+  suggested_next_actions: string[];
+}
+
+export function messageStatus(opts: MessageStatusOptions): MessageStatusResult {
+  const compatibility = legacyCore("message_status", opts);
+  if (compatibility.handled) return compatibility.value;
+  const message = toMessage(getMessageRow(opts.message_id));
+  const replyRow = getDb()
+    .prepare("SELECT * FROM messages WHERE reply_to = ? AND kind = 'reply' ORDER BY id ASC LIMIT 1")
+    .get(message.id) as MessageRow | undefined;
+  const recipient = directory({ project: PROJECT_WILDCARD, area: AREA_WILDCARD })
+    .find((agent) => agent.name === message.to_agent) ?? null;
+  const taskRow = getDb()
+    .prepare("SELECT * FROM tasks WHERE thread_id = ? ORDER BY updated_at DESC LIMIT 1")
+    .get(message.thread_id) as TaskRow | undefined;
+  const relatedTask = taskRow ? toTask(taskRow, lastSeenMap()) : null;
+  const diagnostics: string[] = [];
+  const suggested: string[] = [];
+  const ts = now();
+  if (message.kind === "ask" && !replyRow) {
+    diagnostics.push("ask has no reply yet");
+    suggested.push(`check inbox_status for ${message.to_agent}`);
+  }
+  if (message.status === "pending" && message.claim_deadline !== null && message.claim_deadline >= ts) {
+    diagnostics.push(`message is claimed by ${message.claimed_by ?? "unknown"} until ${message.claim_deadline}`);
+    suggested.push("wait for the claim to expire, or inspect the claiming session");
+  } else if (message.status === "pending") {
+    diagnostics.push("message is unread or claim has expired");
+    suggested.push(`ask ${message.to_agent} to check inbox`);
+  }
+  if (message.status === "delivered" && message.kind === "ask" && !replyRow) {
+    diagnostics.push("ask was delivered but not answered");
+  }
+  if (message.status === "answered") diagnostics.push("ask was answered");
+  if (recipient === null) {
+    diagnostics.push(`recipient ${message.to_agent} is not registered`);
+    suggested.push("check directory or register/start the recipient agent");
+  } else {
+    diagnostics.push(`recipient is ${recipient.status}/${recipient.presence}, seen ${recipient.age_s}s ago`);
+    if (recipient.paused) suggested.push(`resume ${recipient.name}`);
+    if (recipient.presence === "stale") suggested.push(`start or wake ${recipient.name}, or reassign related work`);
+  }
+  if (relatedTask) {
+    diagnostics.push(`thread is linked to task #${relatedTask.id} (${relatedTask.state})`);
+    suggested.push(`check task_result for task #${relatedTask.id}`);
+  }
+  if (suggested.length === 0) suggested.push("read the thread for context");
+  return {
+    message,
+    reply: replyRow ? toMessage(replyRow) : null,
+    recipient,
+    related_task: relatedTask,
+    diagnostics,
+    suggested_next_actions: [...new Set(suggested)],
+  };
+}
+
+export function whyNoReply(messageId: number): MessageStatusResult {
+  const compatibility = legacyCore('why_no_reply', {message_id:messageId});
+  if (compatibility.handled) return compatibility.value;
+  const result = messageStatus({ message_id: messageId });
+  if (result.reply !== null) return result;
+  if (result.message.kind !== "ask") {
+    result.diagnostics.push("message is not an ask; no reply is expected by protocol");
+  }
+  return result;
+}
+
+export interface AskBestOptions {
+  from: string;
+  capability: string;
+  question: string;
+  timeout_s?: number;
+  thread_id?: string;
+  project?: string;
+  area?: string;
+  team?: string;
+  role?: AgentRole;
+}
+
+export async function askBest(opts: AskBestOptions): Promise<Message> {
+  const compatibility = legacyCore("ask_best", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.from);
+  const asker = requireAgent(opts.from);
+
+  // Resolve scope: explicit > asker metadata. "*" means no filter on that dimension.
+  const projectScope = opts.project !== undefined ? opts.project : asker.project;
+  const areaScope = opts.area !== undefined ? opts.area : asker.area;
+  const teamScope = opts.team !== undefined ? opts.team : asker.team;
+  if (projectScope !== null && projectScope !== PROJECT_WILDCARD) validateProject(projectScope);
+  if (areaScope !== null && areaScope !== AREA_WILDCARD) validateArea(areaScope);
+  if (teamScope !== null && teamScope !== TEAM_WILDCARD) validateTeam(teamScope);
+  validateRole(opts.role);
+
+  const db = getDb();
+  const ts = now();
+  const rows = db
+    .prepare(
+      `SELECT * FROM agents
+         WHERE name != ?
+         ORDER BY last_seen DESC`,
+    )
+    .all(opts.from) as AgentRow[];
+
+  const all = rows
+    .map(toAgent)
+    .filter((a) => !a.paused && a.capabilities.includes(opts.capability));
+
+  const scoped = all.filter((a) => {
+    const projectOk =
+      projectScope === null ||
+      projectScope === PROJECT_WILDCARD ||
+      a.project === projectScope ||
+      a.project === null;
+    const areaOk =
+      areaScope === null ||
+      areaScope === AREA_WILDCARD ||
+      a.area === areaScope;
+    const teamOk =
+      teamScope === null ||
+      teamScope === TEAM_WILDCARD ||
+      a.team === teamScope;
+    const roleOk = opts.role === undefined || a.role === opts.role;
+    return projectOk && areaOk && teamOk && roleOk;
+  }).sort((a, b) => {
+    const weightDiff = b.routing_weight - a.routing_weight;
+    if (weightDiff !== 0) return weightDiff;
+    const listeningDiff = Number((b.listening_until ?? 0) > ts) - Number((a.listening_until ?? 0) > ts);
+    if (listeningDiff !== 0) return listeningDiff;
+    return b.last_seen - a.last_seen;
+  });
+
+  if (scoped.length === 0) {
+    const scopedParts = [
+      projectScope !== null && projectScope !== PROJECT_WILDCARD ? `project '${projectScope}'` : null,
+      areaScope !== null && areaScope !== AREA_WILDCARD ? `area '${areaScope}'` : null,
+      teamScope !== null && teamScope !== TEAM_WILDCARD ? `team '${teamScope}'` : null,
+      opts.role !== undefined ? `role '${opts.role}'` : null,
+    ].filter(Boolean);
+    const scopeText = scopedParts.length > 0 ? ` in ${scopedParts.join(", ")}` : "";
+    const hintParts = [
+      projectScope !== null && projectScope !== PROJECT_WILDCARD ? `project="${PROJECT_WILDCARD}"` : null,
+      areaScope !== null && areaScope !== AREA_WILDCARD ? `area="${AREA_WILDCARD}"` : null,
+      teamScope !== null && teamScope !== TEAM_WILDCARD ? `team="${TEAM_WILDCARD}"` : null,
+    ].filter(Boolean);
+    const hint =
+      hintParts.length > 0
+        ? `; pass ${hintParts.join(" and ")} to search more broadly`
+        : "";
+    throw new BusError(
+      "UNKNOWN_AGENT",
+      `no active agent with capability '${opts.capability}'${scopeText}${hint}`,
+    );
+  }
+
+  const target = scoped[0]!;
+  const recencyMs = ts - target.last_seen;
+  if (recencyMs > 5 * 60_000) {
+    throw new BusError(
+      "UNKNOWN_AGENT",
+      `best match '${target.name}' is stale (last seen ${Math.round(recencyMs / 1000)}s ago); no active agent for capability '${opts.capability}'`,
+    );
+  }
+
+  return ask({
+    from: opts.from,
+    to: target.name,
+    question: opts.question,
+    timeout_s: opts.timeout_s,
+    thread_id: opts.thread_id,
+  });
+}
+
+export interface SubscribeOptions {
+  agent: string;
+  channel: string;
+}
+
+export function subscribe(opts: SubscribeOptions): Subscription {
+  const compatibility = legacyCore("subscribe", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  validateChannel(opts.channel);
+  requireAgent(opts.agent);
+
+  const db = getDb();
+  const ts = now();
+  db.prepare(
+    `INSERT INTO subscriptions (channel, agent, subscribed_at)
+       VALUES (?, ?, ?)
+     ON CONFLICT(channel, agent) DO UPDATE SET subscribed_at = excluded.subscribed_at`,
+  ).run(opts.channel, opts.agent, ts);
+
+  return { channel: opts.channel, agent: opts.agent, subscribed_at: ts };
+}
+
+export function unsubscribe(opts: SubscribeOptions): void {
+  const compatibility = legacyCore("unsubscribe", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  validateChannel(opts.channel);
+  getDb()
+    .prepare("DELETE FROM subscriptions WHERE channel = ? AND agent = ?")
+    .run(opts.channel, opts.agent);
+}
+
+export function subscribers(channel: string): string[] {
+  const compatibility = legacyCore('subscribers', {channel});
+  if (compatibility.handled) return compatibility.value;
+  validateChannel(channel);
+  const rows = getDb()
+    .prepare("SELECT agent FROM subscriptions WHERE channel = ? ORDER BY agent")
+    .all(channel) as { agent: string }[];
+  return rows.map((r) => r.agent);
+}
+
+export interface SendChannelOptions {
+  from: string;
+  channel: string;
+  content: string;
+  thread_id?: string;
+}
+
+export function sendChannel(opts: SendChannelOptions): Message[] {
+  const compatibility = legacyCore("send_channel", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.from);
+  validateChannel(opts.channel);
+  if (typeof opts.content !== "string") {
+    throw new BusError("INVALID_INPUT", "content must be a string");
+  }
+  const sender = requireAgent(opts.from);
+  heartbeat(opts.from);
+
+  const recipients = subscribers(opts.channel).filter((a) => a !== opts.from);
+  if (recipients.length === 0) return [];
+
+  const threadId = opts.thread_id ?? newThreadId();
+  const out: Message[] = [];
+  for (const recipient of recipients) {
+    out.push(
+      insertMessage(
+        {
+          from: opts.from,
+          to: recipient,
+          content: opts.content,
+          kind: "msg",
+          channel: opts.channel,
+          thread_id: threadId,
+        },
+        threadId,
+        sender.project,
+        sender.area,
+        sender.team,
+      ),
+    );
+  }
+  return out;
+}
+
+export interface SendTeamOptions {
+  from: string;
+  team?: string;
+  content: string;
+  thread_id?: string;
+  project?: string;
+  area?: string;
+  include_self?: boolean;
+}
+
+interface TeamSelectionOptions {
+  from: string;
+  team?: string;
+  project?: string;
+  area?: string;
+  include_self?: boolean;
+  capability?: string;
+  role?: AgentRole;
+}
+
+interface TeamSelection {
+  team: string;
+  candidates: AgentDirectoryEntry[];
+  recipients: AgentDirectoryEntry[];
+  skipped: Array<{
+    agent: string;
+    reason: "self" | "paused" | "stale" | "capability_mismatch" | "role_mismatch" | "over_limit";
+    presence: AgentDirectoryEntry["presence"];
+    age_s: number;
+  }>;
+}
+
+function selectTeamRecipients(opts: TeamSelectionOptions): TeamSelection {
+  validateName(opts.from);
+  const sender = requireAgent(opts.from);
+  const team = opts.team !== undefined ? opts.team : sender.team;
+  if (!team || team === TEAM_WILDCARD) {
+    throw new BusError("INVALID_INPUT", "team is required for team routing");
+  }
+  validateTeam(team);
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) validateProject(opts.project);
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) validateArea(opts.area);
+  validateRole(opts.role);
+  const candidates = directory({ project: opts.project ?? sender.project ?? undefined, area: opts.area ?? sender.area ?? undefined, team });
+  const recipients: AgentDirectoryEntry[] = [];
+  const skipped: TeamSelection["skipped"] = [];
+  for (const agent of candidates) {
+    let reason: TeamSelection["skipped"][number]["reason"] | null = null;
+    if (opts.include_self !== true && agent.name === opts.from) reason = "self";
+    else if (agent.paused) reason = "paused";
+    else if (agent.presence === "stale") reason = "stale";
+    else if (opts.capability !== undefined && !agent.capabilities.includes(opts.capability)) reason = "capability_mismatch";
+    else if (opts.role !== undefined && agent.role !== opts.role) reason = "role_mismatch";
+    if (reason) {
+      skipped.push({ agent: agent.name, reason, presence: agent.presence, age_s: agent.age_s });
+    } else {
+      recipients.push(agent);
+    }
+  }
+  recipients.sort((a, b) => {
+      const weightDiff = b.routing_weight - a.routing_weight;
+      if (weightDiff !== 0) return weightDiff;
+      return b.last_seen - a.last_seen;
+  });
+  return { team, candidates, recipients, skipped };
+}
+
+function teamRecipients(opts: TeamSelectionOptions): Agent[] {
+  return selectTeamRecipients(opts).recipients;
+}
+
+export function sendTeam(opts: SendTeamOptions): Message[] {
+  const compatibility = legacyCore("send_team", opts);
+  if (compatibility.handled) return compatibility.value;
+  if (typeof opts.content !== "string") {
+    throw new BusError("INVALID_INPUT", "content must be a string");
+  }
+  requireAgent(opts.from);
+  heartbeat(opts.from);
+  const recipients = teamRecipients(opts);
+  if (recipients.length === 0) return [];
+  const threadId = opts.thread_id ?? newThreadId();
+  return recipients.map((recipient) =>
+    insertMessage(
+      {
+        from: opts.from,
+        to: recipient.name,
+        content: opts.content,
+        kind: "msg",
+        thread_id: threadId,
+      },
+      threadId,
+      recipient.project,
+      recipient.area,
+      recipient.team,
+    ),
+  );
+}
+
+export interface AskTeamOptions {
+  from: string;
+  team?: string;
+  question: string;
+  timeout_s?: number;
+  thread_id?: string;
+  project?: string;
+  area?: string;
+  capability?: string;
+  role?: AgentRole;
+}
+
+export async function askTeam(opts: AskTeamOptions): Promise<Message> {
+  const compatibility = legacyCore("ask_team", opts);
+  if (compatibility.handled) return compatibility.value;
+  if (typeof opts.question !== "string") {
+    throw new BusError("INVALID_INPUT", "question must be a string");
+  }
+  const recipients = teamRecipients(opts);
+  if (recipients.length === 0) {
+    throw new BusError("UNKNOWN_AGENT", `no active agent in team '${opts.team ?? requireAgent(opts.from).team ?? ""}' matches the request`);
+  }
+  const recipient = recipients[0]!;
+  return askWithScope(
+    {
+      from: opts.from,
+      to: recipient.name,
+      question: opts.question,
+      timeout_s: opts.timeout_s,
+      thread_id: opts.thread_id,
+    },
+    { project: recipient.project, area: recipient.area, team: recipient.team },
+  );
+}
+
+export function setPaused(name: string, paused: boolean): void {
+  const compatibility = legacyCore('set_agent_status', {agent:name,paused});
+  if (compatibility.handled) return compatibility.value;
+  requireAgent(name);
+  getDb()
+    .prepare("UPDATE agents SET paused = ? WHERE name = ?")
+    .run(paused ? 1 : 0, name);
+}
+
+export function setAgentStatus(name: string, status: AgentStatus): Agent {
+  const compatibility = legacyCore('set_agent_status', {agent:name,status});
+  if (compatibility.handled) return compatibility.value;
+  validateName(name);
+  validateAgentStatus(status);
+  requireAgent(name);
+  getDb()
+    .prepare("UPDATE agents SET status = ?, last_seen = ? WHERE name = ?")
+    .run(status, now(), name);
+  return requireAgent(name);
+}
+
+export function sleepAgent(name: string): Agent {
+  const compatibility = legacyCore('sleep_agent', {agent:name});
+  if (compatibility.handled) return compatibility.value;
+  return setAgentStatus(name, "sleeping");
+}
+
+export function wakeAgent(name: string): Agent {
+  const compatibility = legacyCore('wake_agent', {agent:name});
+  if (compatibility.handled) return compatibility.value;
+  return setAgentStatus(name, "idle");
+}
+
+export interface RecentMessagesOptions {
+  limit?: number;
+  project?: string;
+  area?: string;
+  team?: string;
+  thread_id?: string;
+  since_id?: number;
+  since?: number;
+}
+
+export function recentMessages(arg: number | RecentMessagesOptions = 100): Message[] {
+  const compatibility = legacyCore('recent', typeof arg==='number'?{limit:arg}:arg);
+  if (compatibility.handled) return compatibility.value;
+  const opts: RecentMessagesOptions = typeof arg === "number" ? { limit: arg } : arg;
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
+
+  const db = getDb();
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (opts.since_id !== undefined) {
+    where.push("id > ?");
+    params.push(opts.since_id);
+  }
+  if (opts.since !== undefined) {
+    where.push("created_at >= ?");
+    params.push(opts.since);
+  }
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    validateProject(opts.project);
+    where.push("(project = ? OR project IS NULL)");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    validateArea(opts.area);
+    where.push("(area = ? OR area IS NULL)");
+    params.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) {
+    validateTeam(opts.team);
+    where.push("team = ?");
+    params.push(opts.team);
+  }
+  if (opts.thread_id !== undefined) {
+    where.push("thread_id = ?");
+    params.push(opts.thread_id);
+  }
+  const rows = db
+    .prepare(
+      `SELECT * FROM messages${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY id DESC
+         LIMIT ?`,
+    )
+    .all(...params, limit) as MessageRow[];
+  return rows.reverse().map(toMessage);
+}
+
+export function messagesSince(id: number, limit = 100, project?: string, area?: string, team?: string): Message[] {
+  const compatibility = legacyCore("messagesSince", id);
+  if (compatibility.handled) return compatibility.value;
+  const boundedLimit = Math.min(Math.max(limit, 1), 1000);
+  const where: string[] = ["id > ?"];
+  const params: unknown[] = [id];
+  if (project !== undefined && project !== PROJECT_WILDCARD) {
+    validateProject(project);
+    where.push("(project = ? OR project IS NULL)");
+    params.push(project);
+  }
+  if (area !== undefined && area !== AREA_WILDCARD) {
+    validateArea(area);
+    where.push("(area = ? OR area IS NULL)");
+    params.push(area);
+  }
+  if (team !== undefined && team !== TEAM_WILDCARD) {
+    validateTeam(team);
+    where.push("team = ?");
+    params.push(team);
+  }
+
+  const rows = getDb()
+    .prepare(`SELECT * FROM messages WHERE ${where.join(" AND ")} ORDER BY id ASC LIMIT ?`)
+    .all(...params, boundedLimit) as MessageRow[];
+  return rows.map(toMessage);
+}
+
+export function threadMessages(threadId: string, limit = 200): Message[] {
+  const compatibility = legacyCore('thread', {thread_id:threadId,limit});
+  if (compatibility.handled) return compatibility.value;
+  const rows = getDb()
+    .prepare("SELECT * FROM messages WHERE thread_id = ? ORDER BY id ASC LIMIT ?")
+    .all(threadId, Math.min(Math.max(limit, 1), 1000)) as MessageRow[];
+  return rows.map(toMessage);
+}
+
+export interface MessagePageOptions {
+  project?: string;
+  area?: string;
+  team?: string;
+  before_id?: number;
+  limit?: number;
+  preview_chars?: number;
+}
+
+export interface MessagePagePreview extends MessagePreview {
+  replies_count: number;
+  has_replies: boolean;
+}
+
+export interface MessagePageResult {
+  messages: MessagePagePreview[];
+  next_cursor: number | null;
+  has_more: boolean;
+}
+
+/**
+ * Cursor-paged message history for the cockpit chat. Returns one page of
+ * truncation-safe previews in ascending (oldest -> newest) order plus a cursor
+ * to fetch the next older page. Pass the returned next_cursor as before_id to
+ * page backwards through history without ever loading the whole table.
+ */
+export function messagePage(opts: MessagePageOptions = {}): MessagePageResult {
+  const compatibility = legacyCore("messagePage", opts);
+  if (compatibility.handled) return compatibility.value;
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+  // Show normal messages in full inline; only genuinely huge bodies collapse.
+  const previewChars = Math.min(Math.max(opts.preview_chars ?? 4000, 1), 4000);
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (opts.before_id !== undefined) {
+    where.push("id < ?");
+    params.push(opts.before_id);
+  }
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    validateProject(opts.project);
+    where.push("(project = ? OR project IS NULL)");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    validateArea(opts.area);
+    where.push("(area = ? OR area IS NULL)");
+    params.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) {
+    validateTeam(opts.team);
+    where.push("team = ?");
+    params.push(opts.team);
+  }
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM messages${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY id DESC
+         LIMIT ?`,
+    )
+    .all(...params, limit + 1) as MessageRow[];
+  const hasMore = rows.length > limit;
+  const page = rows.slice(0, limit); // newest -> oldest within this page
+  const oldest = page[page.length - 1];
+  const previews = page
+    .slice()
+    .reverse()
+    .map((row) => toMessagePreview(row, previewChars));
+  // One grouped query for reply counts so roots can show "N replies" without
+  // a request per message. Threading is strictly reply_to-based.
+  const counts = new Map<number, number>();
+  const ids = previews.map((m) => m.id);
+  if (ids.length > 0) {
+    const countRows = getDb()
+      .prepare(
+        `SELECT reply_to AS rid, COUNT(*) AS c FROM messages
+           WHERE reply_to IN (${ids.map(() => "?").join(",")})
+           GROUP BY reply_to`,
+      )
+      .all(...ids) as Array<{ rid: number; c: number }>;
+    for (const row of countRows) counts.set(row.rid, row.c);
+  }
+  return {
+    messages: previews.map((m) => {
+      const c = counts.get(m.id) ?? 0;
+      return { ...m, replies_count: c, has_replies: c > 0 };
+    }),
+    next_cursor: hasMore && oldest ? oldest.id : null,
+    has_more: hasMore,
+  };
+}
+
+export interface MessageThreadResult {
+  root: Message;
+  replies: Message[];
+  count: number;
+}
+
+/**
+ * Fetch a message thread: a root message plus every message that replies to it
+ * (reply_to = root id), oldest first. Threading is reply_to-based only; it is
+ * never inferred from thread_id (which stays the broad conversation grouping).
+ */
+export function messageThread(rootId: number, limit = 200): MessageThreadResult {
+  const compatibility = legacyCore("messageThread", rootId);
+  if (compatibility.handled) return compatibility.value;
+  const root = toMessage(getMessageRow(rootId));
+  const bounded = Math.min(Math.max(limit, 1), 500);
+  const total = (getDb()
+    .prepare("SELECT COUNT(*) AS c FROM messages WHERE reply_to = ?")
+    .get(rootId) as { c: number }).c;
+  const rows = getDb()
+    .prepare("SELECT * FROM messages WHERE reply_to = ? ORDER BY id ASC LIMIT ?")
+    .all(rootId, bounded) as MessageRow[];
+  return { root, replies: rows.map(toMessage), count: total };
+}
+
+// ---------------------------------------------------------------------------
+// Tasks
+// ---------------------------------------------------------------------------
+
+export type TaskState =
+  | "backlog"
+  | "open"
+  | "claimed"
+  | "working"
+  | "blocked"
+  | "completed"
+  | "failed"
+  | "canceled";
+
+export const TERMINAL_TASK_STATES: TaskState[] = ["completed", "failed", "canceled"];
+
+export interface Task {
+  id: number;
+  title: string;
+  description: string | null;
+  thread_id: string;
+  requested_by: string;
+  claimed_by: string | null;
+  state: TaskState;
+  milestone: string | null;
+  priority: number;
+  cwd: string | null;
+  blocked_reason: string | null;
+  blocked_on_task_id: number | null;
+  result: string | null;
+  created_at: number;
+  updated_at: number;
+  claimed_at: number | null;
+  finished_at: number | null;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  required_capability: string | null;
+  mode: TaskMode;
+  expected_output: string | null;
+  deadline_at: number | null;
+  checkin_at: number | null;
+  final_answer: string | null;
+  manager_reviewed: boolean;
+  file_scope: string[];
+  edit_scope: string[];
+  read_scope: string[];
+  ack_required: boolean;
+  acknowledged_at: number | null;
+  acknowledged_by: string | null;
+  review_required: boolean;
+  independent_review: boolean;
+  review_state: TaskReviewState;
+  reviewed_by: string | null;
+  review_notes: string | null;
+  changed_files: string[];
+  pending_assignee: string | null;
+  phase: string | null;
+  session_id: string | null;
+  scope_conflicts?: ScopeConflict[];
+  stale?: boolean;
+  overdue?: boolean;
+  checkin_due?: boolean;
+}
+
+interface TaskRow {
+  id: number;
+  title: string;
+  description: string | null;
+  thread_id: string;
+  requested_by: string;
+  claimed_by: string | null;
+  state: TaskState;
+  milestone: string | null;
+  priority: number;
+  cwd: string | null;
+  blocked_reason: string | null;
+  blocked_on_task_id: number | null;
+  result: string | null;
+  created_at: number;
+  updated_at: number;
+  claimed_at: number | null;
+  finished_at: number | null;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  required_capability: string | null;
+  mode: TaskMode;
+  expected_output: string | null;
+  deadline_at: number | null;
+  checkin_at: number | null;
+  final_answer: string | null;
+  manager_reviewed: number;
+  file_scope: string;
+  edit_scope: string;
+  read_scope: string;
+  ack_required: number;
+  acknowledged_at: number | null;
+  acknowledged_by: string | null;
+  review_required: number;
+  independent_review: number;
+  review_state: TaskReviewState;
+  reviewed_by: string | null;
+  review_notes: string | null;
+  changed_files: string;
+  pending_assignee: string | null;
+  phase: string | null;
+  session_id: string | null;
+}
+
+function readTaskStaleThresholdMs(): number {
+  const raw = process.env.AGENT_BUS_TASK_STALE_MS;
+  if (!raw) return 5 * 60 * 1000;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1000) return 5 * 60 * 1000;
+  return parsed;
+}
+
+export const TASK_STALE_THRESHOLD_MS = readTaskStaleThresholdMs();
+
+const ACTIVE_TASK_STATES: TaskState[] = ["claimed", "working", "blocked"];
+const DEADLINE_ATTENTION_STATES: TaskState[] = ["open", "claimed", "working", "blocked"];
+const CHECKIN_ATTENTION_STATES: TaskState[] = ["claimed", "working", "blocked"];
+
+// Exported so tests and tooling can mirror the state machine without
+// re-declaring it. Terminal states (completed/failed/canceled) have no
+// successors. `claimed -> open` exists for releaseTask-style flows.
+export const ALLOWED_TRANSITIONS: Record<TaskState, readonly TaskState[]> = {
+  backlog: ["open", "canceled"],
+  open: ["backlog", "claimed", "canceled"],
+  claimed: ["working", "completed", "open", "canceled", "failed"],
+  working: ["blocked", "completed", "failed", "canceled"],
+  blocked: ["working", "completed", "failed", "canceled"],
+  completed: [],
+  failed: [],
+  canceled: [],
+};
+
+function toTask(row: TaskRow, lastSeenByAgent?: Map<string, number>): Task {
+  const task: Task = {
+    id: row.id,
+    title: row.title,
+    description: row.description,
+    thread_id: row.thread_id,
+    requested_by: row.requested_by,
+    claimed_by: row.claimed_by,
+    state: row.state,
+    milestone: row.milestone,
+    priority: row.priority,
+    cwd: row.cwd,
+    blocked_reason: row.blocked_reason,
+    blocked_on_task_id: row.blocked_on_task_id,
+    result: row.result,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+    claimed_at: row.claimed_at,
+    finished_at: row.finished_at,
+    project: row.project,
+    area: row.area,
+    team: row.team,
+    required_capability: row.required_capability,
+    mode: row.mode,
+    expected_output: row.expected_output,
+    deadline_at: row.deadline_at,
+    checkin_at: row.checkin_at,
+    final_answer: row.final_answer,
+    manager_reviewed: row.manager_reviewed === 1,
+    file_scope: JSON.parse(row.file_scope) as string[],
+    edit_scope: JSON.parse(row.edit_scope) as string[],
+    read_scope: JSON.parse(row.read_scope) as string[],
+    ack_required: row.ack_required === 1,
+    acknowledged_at: row.acknowledged_at,
+    acknowledged_by: row.acknowledged_by,
+    review_required: row.review_required === 1,
+    independent_review: row.independent_review === 1,
+    review_state: row.review_state,
+    reviewed_by: row.reviewed_by,
+    review_notes: row.review_notes,
+    changed_files: JSON.parse(row.changed_files) as string[],
+    pending_assignee: row.pending_assignee,
+    phase: row.phase,
+    session_id: row.session_id,
+  };
+  if (
+    lastSeenByAgent &&
+    row.claimed_by &&
+    ACTIVE_TASK_STATES.includes(row.state)
+  ) {
+    const lastSeen = lastSeenByAgent.get(row.claimed_by);
+    if (lastSeen !== undefined) {
+      task.stale = now() - lastSeen > TASK_STALE_THRESHOLD_MS;
+    }
+  }
+  return task;
+}
+
+function lastSeenMap(): Map<string, number> {
+  const rows = getDb()
+    .prepare("SELECT name, last_seen FROM agents")
+    .all() as { name: string; last_seen: number }[];
+  return new Map(rows.map((r) => [r.name, r.last_seen]));
+}
+
+function getTaskRow(id: number): TaskRow {
+  const row = getDb()
+    .prepare("SELECT * FROM tasks WHERE id = ?")
+    .get(id) as TaskRow | undefined;
+  if (!row) throw new BusError("TASK_NOT_FOUND", `no task with id ${id}`);
+  return row;
+}
+
+function notifyTaskRequester(task: Task, from: string, content: string): Message | null {
+  if (task.requested_by === from) return null;
+  try {
+    return send({
+      from,
+      to: task.requested_by,
+      content,
+      thread_id: task.thread_id,
+    });
+  } catch (err) {
+    if (err instanceof BusError && err.code === "UNKNOWN_AGENT") return null;
+    throw err;
+  }
+}
+
+export interface ScopeConflict {
+  task_id: number;
+  title: string;
+  claimed_by: string | null;
+  state: TaskState;
+  overlapping_scope: string;
+}
+
+function scopeBase(pattern: string): string {
+  const trimmed = pattern.trim().replace(/^\.\/+/, "");
+  const wildcard = trimmed.search(/[*?[{]/);
+  const raw = wildcard >= 0 ? trimmed.slice(0, wildcard) : trimmed;
+  const slash = raw.lastIndexOf("/");
+  if (wildcard >= 0) return raw.slice(0, slash + 1);
+  return raw.endsWith("/") ? raw : raw;
+}
+
+function scopesOverlap(a: string, b: string): boolean {
+  const left = scopeBase(a);
+  const right = scopeBase(b);
+  if (!left || !right) return false;
+  return left === right || left.startsWith(right) || right.startsWith(left);
+}
+
+function fileMatchesScope(file: string, pattern: string): boolean {
+  const normalizedFile = file.trim().replace(/^\.\/+/, "");
+  const base = scopeBase(pattern);
+  if (!base) return false;
+  if (pattern.includes("*")) return normalizedFile.startsWith(base);
+  return normalizedFile === base || normalizedFile.startsWith(base.endsWith("/") ? base : `${base}/`);
+}
+
+function filesOutsideScope(files: string[], scope: string[]): string[] {
+  if (scope.length === 0 || files.length === 0) return [];
+  return files.filter((file) => !scope.some((pattern) => fileMatchesScope(file, pattern)));
+}
+
+export interface CheckScopeConflictsOptions {
+  file_scope?: string[];
+  edit_scope?: string[];
+  project?: string | null;
+  area?: string | null;
+  team?: string | null;
+  exclude_task_id?: number;
+}
+
+export function checkScopeConflicts(opts: CheckScopeConflictsOptions): ScopeConflict[] {
+  const compatibility = legacyCore("check_scope_conflicts", opts);
+  if (compatibility.handled) return compatibility.value;
+  if (opts.project !== undefined && opts.project !== null && opts.project !== PROJECT_WILDCARD) {
+    validateProject(opts.project);
+  }
+  validateArea(opts.area);
+  validateTeam(opts.team);
+  const requestedScope = opts.edit_scope ?? opts.file_scope ?? [];
+  if (!requestedScope.every((value) => typeof value === "string")) {
+    throw new BusError("INVALID_INPUT", "edit_scope/file_scope must be an array of strings");
+  }
+  const scope = requestedScope.filter((value) => value.trim().length > 0);
+  if (scope.length === 0) return [];
+
+  const where = ["state IN ('claimed','working','blocked')", "mode IN ('edit_files','propose_patch')", "edit_scope != '[]'"];
+  const params: unknown[] = [];
+  if (opts.project !== undefined && opts.project !== null && opts.project !== PROJECT_WILDCARD) {
+    where.push("project = ?");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== null && opts.area !== AREA_WILDCARD) {
+    where.push("area = ?");
+    params.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== null && opts.team !== TEAM_WILDCARD) {
+    where.push("team = ?");
+    params.push(opts.team);
+  }
+  if (opts.exclude_task_id !== undefined) {
+    where.push("id != ?");
+    params.push(opts.exclude_task_id);
+  }
+  const rows = getDb()
+    .prepare(`SELECT * FROM tasks WHERE ${where.join(" AND ")} ORDER BY updated_at DESC`)
+    .all(...params) as TaskRow[];
+  const conflicts: ScopeConflict[] = [];
+  for (const row of rows) {
+    const otherScope = JSON.parse(row.edit_scope) as string[];
+    for (const requested of scope) {
+      const overlap = otherScope.find((existing) => scopesOverlap(requested, existing));
+      if (overlap) {
+        conflicts.push({
+          task_id: row.id,
+          title: row.title,
+          claimed_by: row.claimed_by,
+          state: row.state,
+          overlapping_scope: overlap,
+        });
+        break;
+      }
+    }
+  }
+  return conflicts;
+}
+
+function assertNoScopeConflicts(editScope: string[], project: string | null, area: string | null, excludeTaskId?: number, team?: string | null): void {
+  const conflicts = checkScopeConflicts({
+    edit_scope: editScope,
+    project,
+    area,
+    team,
+    exclude_task_id: excludeTaskId,
+  });
+  if (conflicts.length > 0) {
+    const first = conflicts[0]!;
+    throw new BusError(
+      "TASK_SCOPE_CONFLICT",
+      `file_scope overlaps active task #${first.task_id} (${first.overlapping_scope})`,
+    );
+  }
+}
+
+export interface CreateTaskOptions {
+  requested_by: string;
+  title: string;
+  description?: string;
+  thread_id?: string;
+  state?: "backlog" | "open";
+  milestone?: string | null;
+  priority?: number;
+  cwd?: string;
+  blocked_on_task_id?: number;
+  project?: string | null;
+  area?: string | null;
+  team?: string | null;
+  required_capability?: string | null;
+  mode?: TaskMode;
+  expected_output?: string | null;
+  deadline_at?: number | null;
+  checkin_at?: number | null;
+  final_answer?: string | null;
+  manager_reviewed?: boolean;
+  file_scope?: string[];
+  edit_scope?: string[];
+  read_scope?: string[];
+  ack_required?: boolean;
+  review_required?: boolean;
+  independent_review?: boolean;
+  changed_files?: string[];
+  phase?: string | null;
+  session_id?: string | null;
+  allow_conflicts?: boolean;
+}
+
+export function createTask(opts: CreateTaskOptions): Task {
+  const compatibility = legacyCore("create_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.requested_by);
+  if (typeof opts.title !== "string" || opts.title.length === 0 || opts.title.length > 200) {
+    throw new BusError("INVALID_INPUT", "title must be 1-200 chars");
+  }
+  if (opts.description !== undefined && typeof opts.description !== "string") {
+    throw new BusError("INVALID_INPUT", "description must be a string");
+  }
+  if (opts.priority !== undefined && !Number.isFinite(opts.priority)) {
+    throw new BusError("INVALID_INPUT", "priority must be a number");
+  }
+  if (opts.state !== undefined && opts.state !== "backlog" && opts.state !== "open") {
+    throw new BusError("INVALID_INPUT", "task create state must be backlog or open");
+  }
+  validateMilestone(opts.milestone);
+  validateProject(opts.project);
+  validateArea(opts.area);
+  validateTeam(opts.team);
+  validateTaskMode(opts.mode);
+  if (opts.required_capability !== undefined && opts.required_capability !== null && opts.required_capability.length === 0) {
+    throw new BusError("INVALID_INPUT", "required_capability must be non-empty or null");
+  }
+  if (opts.file_scope !== undefined && !opts.file_scope.every((value) => typeof value === "string")) {
+    throw new BusError("INVALID_INPUT", "file_scope must be an array of strings");
+  }
+  if (opts.edit_scope !== undefined && !opts.edit_scope.every((value) => typeof value === "string")) {
+    throw new BusError("INVALID_INPUT", "edit_scope must be an array of strings");
+  }
+  if (opts.read_scope !== undefined && !opts.read_scope.every((value) => typeof value === "string")) {
+    throw new BusError("INVALID_INPUT", "read_scope must be an array of strings");
+  }
+  if (opts.changed_files !== undefined && !opts.changed_files.every((value) => typeof value === "string")) {
+    throw new BusError("INVALID_INPUT", "changed_files must be an array of strings");
+  }
+  validateSessionId(opts.session_id);
+  const requester = requireAgent(opts.requested_by);
+  heartbeat(opts.requested_by);
+
+  const db = getDb();
+  if (opts.blocked_on_task_id !== undefined) {
+    const exists = db
+      .prepare("SELECT 1 FROM tasks WHERE id = ?")
+      .get(opts.blocked_on_task_id);
+    if (!exists) {
+      throw new BusError(
+        "TASK_NOT_FOUND",
+        `blocked_on_task_id ${opts.blocked_on_task_id} does not exist`,
+      );
+    }
+  }
+
+  const ts = now();
+  const threadId = opts.thread_id ?? newThreadId();
+  const project = opts.project !== undefined ? opts.project : requester.project;
+  const area = opts.area !== undefined ? opts.area : requester.area;
+  const team = opts.team !== undefined ? opts.team : requester.team;
+  const requiredCapability = opts.required_capability ?? null;
+  const mode = opts.mode ?? "edit_files";
+  const rawFileScope = opts.file_scope ?? [];
+  const rawEditScope = opts.edit_scope ?? ((mode === "edit_files" || mode === "propose_patch") ? rawFileScope : []);
+  const rawReadScope = opts.read_scope ?? rawFileScope;
+  const sessionId = opts.session_id !== undefined ? opts.session_id : requester.session_id;
+  if (opts.allow_conflicts !== true && (mode === "edit_files" || mode === "propose_patch")) {
+    assertNoScopeConflicts(rawEditScope, project, area, undefined, team);
+  }
+  const fileScope = JSON.stringify(rawFileScope);
+  const editScope = JSON.stringify(rawEditScope);
+  const readScope = JSON.stringify(rawReadScope);
+  const changedFiles = JSON.stringify(opts.changed_files ?? []);
+  const reviewRequired = opts.review_required === true;
+  const info = db
+    .prepare(
+      `INSERT INTO tasks
+         (title, description, thread_id, requested_by, state, milestone, priority, cwd, blocked_on_task_id, created_at, updated_at, project, area, team, required_capability, mode, expected_output, deadline_at, checkin_at, final_answer, manager_reviewed, file_scope, edit_scope, read_scope, ack_required, review_required, independent_review, review_state, changed_files, phase, session_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      opts.title,
+      opts.description ?? null,
+      threadId,
+      opts.requested_by,
+      opts.state ?? "open",
+      opts.milestone ?? null,
+      opts.priority ?? 0,
+      opts.cwd ?? null,
+      opts.blocked_on_task_id ?? null,
+      ts,
+      ts,
+      project,
+      area,
+      team,
+      requiredCapability,
+      mode,
+      opts.expected_output ?? null,
+      opts.deadline_at ?? null,
+      opts.checkin_at ?? null,
+      opts.final_answer ?? null,
+      opts.manager_reviewed === true ? 1 : 0,
+      fileScope,
+      editScope,
+      readScope,
+      opts.ack_required === true ? 1 : 0,
+      reviewRequired ? 1 : 0,
+      opts.independent_review === true ? 1 : 0,
+      reviewRequired ? "pending" : "none",
+      changedFiles,
+      opts.phase ?? null,
+      sessionId,
+    );
+
+  const task = toTask(getTaskRow(info.lastInsertRowid as number));
+  runLocalHook("task.created", task);
+  return task;
+}
+
+export interface ClaimTaskOptions {
+  agent: string;
+  task_id: number;
+  allow_conflicts?: boolean;
+}
+
+export function claimTask(opts: ClaimTaskOptions): Task {
+  const compatibility = legacyCore("claim_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  const agent = requireAgent(opts.agent);
+  heartbeat(opts.agent);
+
+  const db = getDb();
+  const row = getTaskRow(opts.task_id);
+  if (row.required_capability !== null && !agent.capabilities.includes(row.required_capability)) {
+    throw new BusError(
+      "TASK_FORBIDDEN",
+      `task ${opts.task_id} requires capability '${row.required_capability}'`,
+    );
+  }
+  if (row.project !== null && agent.project !== null && row.project !== agent.project) {
+    throw new BusError("TASK_FORBIDDEN", `task ${opts.task_id} belongs to project '${row.project}'`);
+  }
+  if (row.area !== null && agent.area !== null && row.area !== agent.area) {
+    if (row.area !== AREA_WILDCARD && agent.area !== AREA_WILDCARD) {
+      throw new BusError("TASK_FORBIDDEN", `task ${opts.task_id} belongs to area '${row.area}'`);
+    }
+  }
+  if (row.team !== null && agent.team !== null && row.team !== agent.team) {
+    if (row.team !== TEAM_WILDCARD && agent.team !== TEAM_WILDCARD) {
+      throw new BusError("TASK_FORBIDDEN", `task ${opts.task_id} belongs to team '${row.team}'`);
+    }
+  }
+  if (row.pending_assignee !== null && row.pending_assignee !== opts.agent) {
+    throw new BusError("TASK_FORBIDDEN", `task ${opts.task_id} is reserved for '${row.pending_assignee}'`);
+  }
+  const rowScope = JSON.parse(row.edit_scope) as string[];
+  if (opts.allow_conflicts !== true && (row.mode === "edit_files" || row.mode === "propose_patch")) {
+    assertNoScopeConflicts(rowScope, row.project, row.area, opts.task_id, row.team);
+  }
+  const ts = now();
+  const info = db
+    .prepare(
+      `UPDATE tasks
+         SET state = 'claimed', claimed_by = ?, pending_assignee = NULL, claimed_at = ?, updated_at = ?
+       WHERE id = ? AND state = 'open' AND claimed_by IS NULL`,
+    )
+    .run(opts.agent, ts, ts, opts.task_id);
+
+  if (info.changes === 0) {
+    const existing = db
+      .prepare("SELECT * FROM tasks WHERE id = ?")
+      .get(opts.task_id) as TaskRow | undefined;
+    if (!existing) throw new BusError("TASK_NOT_FOUND", `no task with id ${opts.task_id}`);
+    throw new BusError(
+      "TASK_NOT_CLAIMABLE",
+      `task ${opts.task_id} is in state '${existing.state}'${existing.claimed_by ? `, held by '${existing.claimed_by}'` : ""}`,
+    );
+  }
+
+  const task = toTask(getTaskRow(opts.task_id));
+  if (task.requested_by !== opts.agent) {
+    send({
+      from: opts.agent,
+      to: task.requested_by,
+      content: `claimed task #${task.id}: ${task.title}`,
+      thread_id: task.thread_id,
+    });
+  }
+  runLocalHook("task.claimed", task);
+  return task;
+}
+
+export interface UpdateTaskOptions {
+  agent: string;
+  task_id: number;
+  state?: TaskState;
+  milestone?: string | null;
+  blocked_reason?: string | null;
+  blocked_on_task_id?: number | null;
+  result?: string | null;
+  priority?: number;
+  expected_output?: string | null;
+  deadline_at?: number | null;
+  checkin_at?: number | null;
+  final_answer?: string | null;
+  manager_reviewed?: boolean;
+  file_scope?: string[];
+  edit_scope?: string[];
+  read_scope?: string[];
+  mode?: TaskMode;
+  ack_required?: boolean;
+  review_required?: boolean;
+  independent_review?: boolean;
+  review_state?: TaskReviewState;
+  reviewed_by?: string | null;
+  review_notes?: string | null;
+  changed_files?: string[];
+  phase?: string | null;
+  session_id?: string | null;
+  allow_conflicts?: boolean;
+}
+
+export function updateTask(opts: UpdateTaskOptions): Task {
+  const compatibility = legacyCore("update_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  requireAgent(opts.agent);
+  heartbeat(opts.agent);
+
+  const db = getDb();
+  const row = getTaskRow(opts.task_id);
+
+  if (row.claimed_by !== null && row.claimed_by !== opts.agent && row.requested_by !== opts.agent) {
+    throw new BusError(
+      "TASK_FORBIDDEN",
+      `task ${opts.task_id} is held by '${row.claimed_by}'; only the holder or requester can update it`,
+    );
+  }
+  if (row.claimed_by === null && row.requested_by !== opts.agent && opts.state !== undefined) {
+    throw new BusError(
+      "TASK_FORBIDDEN",
+      `task ${opts.task_id} is unclaimed; only the requester can change state until someone claims it`,
+    );
+  }
+
+  const ts = now();
+  const sets: string[] = ["updated_at = ?"];
+  const params: unknown[] = [ts];
+
+  if (opts.state !== undefined) {
+    const allowed = ALLOWED_TRANSITIONS[row.state];
+    if (!allowed.includes(opts.state)) {
+      throw new BusError(
+        "TASK_INVALID_TRANSITION",
+        `cannot transition task ${opts.task_id} from '${row.state}' to '${opts.state}'`,
+      );
+    }
+    sets.push("state = ?");
+    params.push(opts.state);
+
+    if (opts.state === "open") {
+      sets.push("claimed_by = NULL", "pending_assignee = NULL", "claimed_at = NULL");
+    }
+    if (opts.state === "backlog") {
+      sets.push("claimed_by = NULL", "pending_assignee = NULL", "claimed_at = NULL", "phase = NULL");
+    }
+    if (TERMINAL_TASK_STATES.includes(opts.state)) {
+      if (opts.state === "completed" && row.review_required === 1 && row.review_state !== "approved") {
+        throw new BusError("TASK_REVIEW_REQUIRED", `task ${opts.task_id} requires approved review before completion`);
+      }
+      sets.push("finished_at = ?");
+      params.push(ts);
+    }
+  }
+  if (opts.blocked_reason !== undefined) {
+    sets.push("blocked_reason = ?");
+    params.push(opts.blocked_reason);
+  }
+  if (opts.blocked_on_task_id !== undefined) {
+    if (opts.blocked_on_task_id !== null) {
+      const exists = db
+        .prepare("SELECT 1 FROM tasks WHERE id = ?")
+        .get(opts.blocked_on_task_id);
+      if (!exists) {
+        throw new BusError(
+          "TASK_NOT_FOUND",
+          `blocked_on_task_id ${opts.blocked_on_task_id} does not exist`,
+        );
+      }
+    }
+    sets.push("blocked_on_task_id = ?");
+    params.push(opts.blocked_on_task_id);
+  }
+  if (opts.result !== undefined) {
+    sets.push("result = ?");
+    params.push(opts.result);
+  }
+  if (opts.priority !== undefined) {
+    if (!Number.isFinite(opts.priority)) {
+      throw new BusError("INVALID_INPUT", "priority must be a number");
+    }
+    sets.push("priority = ?");
+    params.push(opts.priority);
+  }
+  if (opts.milestone !== undefined) {
+    validateMilestone(opts.milestone);
+    sets.push("milestone = ?");
+    params.push(opts.milestone);
+  }
+  if (opts.mode !== undefined) {
+    validateTaskMode(opts.mode);
+    sets.push("mode = ?");
+    params.push(opts.mode);
+  }
+  if (opts.expected_output !== undefined) {
+    sets.push("expected_output = ?");
+    params.push(opts.expected_output);
+  }
+  if (opts.deadline_at !== undefined) {
+    sets.push("deadline_at = ?");
+    params.push(opts.deadline_at);
+  }
+  if (opts.checkin_at !== undefined) {
+    sets.push("checkin_at = ?");
+    params.push(opts.checkin_at);
+  }
+  if (opts.final_answer !== undefined) {
+    sets.push("final_answer = ?");
+    params.push(opts.final_answer);
+  }
+  if (opts.manager_reviewed !== undefined) {
+    sets.push("manager_reviewed = ?");
+    params.push(opts.manager_reviewed ? 1 : 0);
+  }
+  if (opts.phase !== undefined) {
+    sets.push("phase = ?");
+    params.push(opts.phase);
+  }
+  if (opts.session_id !== undefined) {
+    validateSessionId(opts.session_id);
+    sets.push("session_id = ?");
+    params.push(opts.session_id);
+  }
+  if (opts.file_scope !== undefined) {
+    if (!opts.file_scope.every((value) => typeof value === "string")) {
+      throw new BusError("INVALID_INPUT", "file_scope must be an array of strings");
+    }
+    sets.push("file_scope = ?");
+    params.push(JSON.stringify(opts.file_scope));
+  }
+  if (opts.edit_scope !== undefined) {
+    if (!opts.edit_scope.every((value) => typeof value === "string")) {
+      throw new BusError("INVALID_INPUT", "edit_scope must be an array of strings");
+    }
+    if (opts.allow_conflicts !== true && (opts.mode ?? row.mode) !== "investigate_only" && (opts.mode ?? row.mode) !== "test_only") {
+      assertNoScopeConflicts(opts.edit_scope, row.project, row.area, opts.task_id, row.team);
+    }
+    sets.push("edit_scope = ?");
+    params.push(JSON.stringify(opts.edit_scope));
+  } else if (opts.file_scope !== undefined && opts.allow_conflicts !== true && (opts.mode ?? row.mode) !== "investigate_only" && (opts.mode ?? row.mode) !== "test_only") {
+    assertNoScopeConflicts(opts.file_scope, row.project, row.area, opts.task_id, row.team);
+    sets.push("edit_scope = ?");
+    params.push(JSON.stringify(opts.file_scope));
+  }
+  if (opts.read_scope !== undefined) {
+    if (!opts.read_scope.every((value) => typeof value === "string")) {
+      throw new BusError("INVALID_INPUT", "read_scope must be an array of strings");
+    }
+    sets.push("read_scope = ?");
+    params.push(JSON.stringify(opts.read_scope));
+  }
+  if (opts.ack_required !== undefined) {
+    sets.push("ack_required = ?");
+    params.push(opts.ack_required ? 1 : 0);
+  }
+  if (opts.review_required !== undefined) {
+    sets.push("review_required = ?");
+    params.push(opts.review_required ? 1 : 0);
+    if (opts.review_required && row.review_state === "none" && opts.review_state === undefined) {
+      sets.push("review_state = ?");
+      params.push("pending");
+    }
+  }
+  if (opts.independent_review !== undefined) {
+    sets.push("independent_review = ?");
+    params.push(opts.independent_review ? 1 : 0);
+  }
+  if (opts.review_state !== undefined) {
+    validateReviewState(opts.review_state);
+    sets.push("review_state = ?");
+    params.push(opts.review_state);
+  }
+  if (opts.reviewed_by !== undefined) {
+    if (opts.reviewed_by !== null) validateName(opts.reviewed_by);
+    sets.push("reviewed_by = ?");
+    params.push(opts.reviewed_by);
+  }
+  if (opts.review_notes !== undefined) {
+    sets.push("review_notes = ?");
+    params.push(opts.review_notes);
+  }
+  if (opts.changed_files !== undefined) {
+    if (!opts.changed_files.every((value) => typeof value === "string")) {
+      throw new BusError("INVALID_INPUT", "changed_files must be an array of strings");
+    }
+    const editScope = JSON.parse(row.edit_scope) as string[];
+    const fallbackScope = JSON.parse(row.file_scope) as string[];
+    const outside = filesOutsideScope(opts.changed_files, editScope.length > 0 ? editScope : fallbackScope);
+    if (outside.length > 0 && opts.allow_conflicts !== true) {
+      throw new BusError("TASK_SCOPE_CONFLICT", `changed_files outside file_scope: ${outside.join(", ")}`);
+    }
+    sets.push("changed_files = ?");
+    params.push(JSON.stringify(opts.changed_files));
+  }
+
+  if (sets.length === 1) {
+    return toTask(row);
+  }
+
+  params.push(opts.task_id);
+  db.prepare(`UPDATE tasks SET ${sets.join(", ")} WHERE id = ?`).run(...params);
+  const task = toTask(getTaskRow(opts.task_id));
+  if (opts.state !== undefined && task.requested_by !== opts.agent && ["working", "blocked", "completed", "failed"].includes(opts.state)) {
+    notifyTaskRequester(task, opts.agent, `task #${task.id} ${opts.state}: ${task.title}${opts.final_answer ? ` - ${opts.final_answer}` : opts.result ? ` - ${opts.result}` : ""}`);
+  }
+  runLocalHook(`task.${task.state}`, task);
+  return task;
+}
+
+export interface ReleaseTaskOptions {
+  agent: string;
+  task_id: number;
+}
+
+export function releaseTask(opts: ReleaseTaskOptions): Task {
+  const compatibility = legacyCore("release_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  requireAgent(opts.agent);
+  heartbeat(opts.agent);
+
+  const db = getDb();
+  const row = getTaskRow(opts.task_id);
+
+  if (row.claimed_by !== opts.agent && row.requested_by !== opts.agent) {
+    throw new BusError(
+      "TASK_FORBIDDEN",
+      `task ${opts.task_id} is held by '${row.claimed_by}'; only the holder or requester can release it`,
+    );
+  }
+  if (TERMINAL_TASK_STATES.includes(row.state)) {
+    throw new BusError(
+      "TASK_INVALID_TRANSITION",
+      `task ${opts.task_id} is already in terminal state '${row.state}'`,
+    );
+  }
+
+  const ts = now();
+  db.prepare(
+    `UPDATE tasks
+       SET state = 'open', claimed_by = NULL, pending_assignee = NULL, claimed_at = NULL, updated_at = ?
+     WHERE id = ?`,
+  ).run(ts, opts.task_id);
+
+  return toTask(getTaskRow(opts.task_id));
+}
+
+export interface RemoveAgentOptions {
+  name: string;
+  release_tasks?: boolean;
+  force?: boolean;
+}
+
+export interface RemoveAgentResult {
+  removed_agent: Agent;
+  active_tasks: number[];
+  released_tasks: number[];
+  subscriptions_deleted: number;
+  preserved_history: true;
+}
+
+export interface DeleteTeamOptions {
+  team: string;
+  project?: string;
+  area?: string;
+  release_tasks?: boolean;
+  force?: boolean;
+}
+
+export interface DeleteTeamResult {
+  team: string;
+  project: string | null;
+  area: string | null;
+  removed_agents: string[];
+  active_tasks: number[];
+  released_tasks: number[];
+  unscoped: Record<"messages" | "tasks" | "task_events" | "test_results" | "decisions" | "memories", number>;
+  preserved_history: true;
+}
+
+function activeTaskRowsForAgent(agent: string): TaskRow[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM tasks
+       WHERE claimed_by = ?
+         AND state IN (${ACTIVE_TASK_STATES.map(() => "?").join(",")})
+       ORDER BY id ASC`,
+    )
+    .all(agent, ...ACTIVE_TASK_STATES) as TaskRow[];
+}
+
+function releaseTaskRows(rows: TaskRow[], byAgent?: string): number[] {
+  if (rows.length === 0) return [];
+  const db = getDb();
+  const ts = now();
+  const update = db.prepare(
+    `UPDATE tasks
+       SET state = 'open',
+           claimed_by = NULL,
+           pending_assignee = NULL,
+           claimed_at = NULL,
+           phase = NULL,
+           updated_at = ?
+     WHERE id = ?`,
+  );
+  const insertEvent = db.prepare(
+    `INSERT INTO task_events (task_id, by_agent, event_type, message, phase, metadata, project, area, team, created_at)
+     VALUES (?, ?, 'note', ?, NULL, ?, ?, ?, ?, ?)`,
+  );
+  for (const row of rows) {
+    const eventAgent = byAgent ?? row.claimed_by ?? row.requested_by;
+    update.run(ts, row.id);
+    insertEvent.run(
+      row.id,
+      eventAgent,
+      `released by cleanup; previous holder was ${row.claimed_by ?? "none"}`,
+      JSON.stringify({ cleanup: true, previous_holder: row.claimed_by }),
+      row.project,
+      row.area,
+      row.team,
+      ts,
+    );
+  }
+  return rows.map((row) => row.id);
+}
+
+export function removeAgent(opts: RemoveAgentOptions): RemoveAgentResult {
+  const compatibility = legacyCore("remove_agent", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.name);
+  const removedAgent = requireAgent(opts.name);
+  const activeTasks = activeTaskRowsForAgent(opts.name);
+  if (activeTasks.length > 0 && opts.release_tasks !== true && opts.force !== true) {
+    throw new BusError(
+      "AGENT_HAS_ACTIVE_TASKS",
+      `agent '${opts.name}' holds active tasks: ${activeTasks.map((task) => `#${task.id}`).join(", ")}; pass release_tasks:true to reopen them`,
+    );
+  }
+
+  const releasedTasks = releaseTaskRows(activeTasks, opts.name);
+  const db = getDb();
+  const subscriptionsDeleted = (db
+    .prepare("SELECT COUNT(*) AS c FROM subscriptions WHERE agent = ?")
+    .get(opts.name) as { c: number }).c;
+  db.prepare("DELETE FROM subscriptions WHERE agent = ?").run(opts.name);
+  db.prepare(
+    `UPDATE agents
+       SET paused = 1,
+           status = 'sleeping',
+           project = NULL,
+           area = NULL,
+           team = NULL,
+           session_id = NULL,
+           removed_at = ?
+     WHERE name = ?`,
+  ).run(now(), opts.name);
+
+  return {
+    removed_agent: removedAgent,
+    active_tasks: activeTasks.map((task) => task.id),
+    released_tasks: releasedTasks,
+    subscriptions_deleted: subscriptionsDeleted,
+    preserved_history: true,
+  };
+}
+
+function teamScopeWhere(opts: DeleteTeamOptions): { where: string; params: unknown[] } {
+  validateTeam(opts.team);
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) validateProject(opts.project);
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) validateArea(opts.area);
+  const where = ["team = ?"];
+  const params: unknown[] = [opts.team];
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    where.push("project = ?");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    where.push("area = ?");
+    params.push(opts.area);
+  }
+  return { where: where.join(" AND "), params };
+}
+
+export function deleteTeam(opts: DeleteTeamOptions): DeleteTeamResult {
+  const compatibility = legacyCore("delete_team", opts);
+  if (compatibility.handled) return compatibility.value;
+  const db = getDb();
+  const scope = teamScopeWhere(opts);
+  const tables = ["agents", "messages", "tasks", "task_events", "test_results", "decisions", "memories"] as const;
+  const existing = tables.reduce((count, table) => {
+    const agentLiveFilter = table === "agents" ? " AND removed_at IS NULL" : "";
+    const row = db.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${scope.where}${agentLiveFilter}`).get(...scope.params) as { c: number };
+    return count + row.c;
+  }, 0);
+  if (existing === 0) {
+    throw new BusError("TEAM_NOT_FOUND", `team '${opts.team}' was not found in the requested scope`);
+  }
+
+  const activeTasks = db
+    .prepare(
+      `SELECT * FROM tasks
+       WHERE ${scope.where}
+         AND state IN (${ACTIVE_TASK_STATES.map(() => "?").join(",")})
+       ORDER BY id ASC`,
+    )
+    .all(...scope.params, ...ACTIVE_TASK_STATES) as TaskRow[];
+  if (activeTasks.length > 0 && opts.release_tasks !== true && opts.force !== true) {
+    throw new BusError(
+      "TEAM_HAS_ACTIVE_TASKS",
+      `team '${opts.team}' has active tasks: ${activeTasks.map((task) => `#${task.id}`).join(", ")}; pass release_tasks:true to reopen them`,
+    );
+  }
+
+  const releasedTasks = releaseTaskRows(activeTasks);
+  const removedAgents = (db
+    .prepare(`SELECT name FROM agents WHERE ${scope.where} AND removed_at IS NULL ORDER BY name ASC`)
+    .all(...scope.params) as { name: string }[]).map((row) => row.name);
+  for (const agent of removedAgents) {
+    db.prepare("DELETE FROM subscriptions WHERE agent = ?").run(agent);
+  }
+  db.prepare(
+    `UPDATE agents
+       SET paused = 1,
+           status = 'sleeping',
+           project = NULL,
+           area = NULL,
+           team = NULL,
+           session_id = NULL,
+           removed_at = ?
+     WHERE ${scope.where} AND removed_at IS NULL`,
+  ).run(now(), ...scope.params);
+
+  const unscoped = {
+    messages: db.prepare(`UPDATE messages SET team = NULL WHERE ${scope.where}`).run(...scope.params).changes,
+    tasks: db.prepare(`UPDATE tasks SET team = NULL WHERE ${scope.where}`).run(...scope.params).changes,
+    task_events: db.prepare(`UPDATE task_events SET team = NULL WHERE ${scope.where}`).run(...scope.params).changes,
+    test_results: db.prepare(`UPDATE test_results SET team = NULL WHERE ${scope.where}`).run(...scope.params).changes,
+    decisions: db.prepare(`UPDATE decisions SET team = NULL WHERE ${scope.where}`).run(...scope.params).changes,
+    memories: db.prepare(`UPDATE memories SET team = NULL WHERE ${scope.where}`).run(...scope.params).changes,
+  };
+
+  return {
+    team: opts.team,
+    project: opts.project === PROJECT_WILDCARD ? null : (opts.project ?? null),
+    area: opts.area === AREA_WILDCARD ? null : (opts.area ?? null),
+    removed_agents: removedAgents,
+    active_tasks: activeTasks.map((task) => task.id),
+    released_tasks: releasedTasks,
+    unscoped,
+    preserved_history: true,
+  };
+}
+
+export interface ListTasksOptions {
+  state?: TaskState | TaskState[];
+  milestone?: string;
+  claimed_by?: string;
+  requested_by?: string;
+  thread_id?: string;
+  include_terminal?: boolean;
+  limit?: number;
+  project?: string;
+  area?: string;
+  team?: string;
+  required_capability?: string;
+  mode?: TaskMode;
+  manager_reviewed?: boolean;
+}
+
+export function listTasks(opts: ListTasksOptions = {}): Task[] {
+  const compatibility = legacyCore("list_tasks", opts);
+  if (compatibility.handled) return compatibility.value;
+  const db = getDb();
+  const where: string[] = [];
+  const params: unknown[] = [];
+
+  if (opts.state !== undefined) {
+    const states = Array.isArray(opts.state) ? opts.state : [opts.state];
+    if (states.length === 0) return [];
+    where.push(`state IN (${states.map(() => "?").join(",")})`);
+    params.push(...states);
+  } else if (opts.include_terminal !== true) {
+    where.push(`state NOT IN ('completed','failed','canceled')`);
+  }
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    validateProject(opts.project);
+    // Scoped: only this project. NULL tasks are hidden until project='*'.
+    where.push("project = ?");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    validateArea(opts.area);
+    // Scoped: only this area. NULL-area tasks are hidden until area='*'.
+    where.push("area = ?");
+    params.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) {
+    validateTeam(opts.team);
+    where.push("team = ?");
+    params.push(opts.team);
+  }
+  if (opts.required_capability !== undefined) {
+    where.push("required_capability = ?");
+    params.push(opts.required_capability);
+  }
+  if (opts.mode !== undefined) {
+    validateTaskMode(opts.mode);
+    where.push("mode = ?");
+    params.push(opts.mode);
+  }
+  if (opts.milestone !== undefined) {
+    validateMilestone(opts.milestone);
+    where.push("milestone = ?");
+    params.push(opts.milestone);
+  }
+  if (opts.manager_reviewed !== undefined) {
+    where.push("manager_reviewed = ?");
+    params.push(opts.manager_reviewed ? 1 : 0);
+  }
+  if (opts.claimed_by !== undefined) {
+    where.push("claimed_by = ?");
+    params.push(opts.claimed_by);
+  }
+  if (opts.requested_by !== undefined) {
+    where.push("requested_by = ?");
+    params.push(opts.requested_by);
+  }
+  if (opts.thread_id !== undefined) {
+    where.push("thread_id = ?");
+    params.push(opts.thread_id);
+  }
+
+  const limit = Math.min(Math.max(opts.limit ?? 100, 1), 500);
+  const sql = `SELECT * FROM tasks${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
+                ORDER BY priority DESC, created_at ASC
+                LIMIT ?`;
+  const rows = db.prepare(sql).all(...params, limit) as TaskRow[];
+  const seen = lastSeenMap();
+  return rows.map((r) => toTask(r, seen));
+}
+
+export interface AssignTaskOptions {
+  task_id: number;
+  to_agent: string;
+  allow_conflicts?: boolean;
+  allow_pending_agent?: boolean;
+}
+
+export function assignTask(opts: AssignTaskOptions): Task {
+  const compatibility = legacyCore("assign_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.to_agent);
+  let agent: Agent | null = null;
+  try {
+    agent = requireAgent(opts.to_agent);
+  } catch (error) {
+    if (!(error instanceof BusError) || error.code !== "UNKNOWN_AGENT" || opts.allow_pending_agent !== true) throw error;
+  }
+  const row = getTaskRow(opts.task_id);
+  if (row.state !== "open" || row.claimed_by !== null) {
+    throw new BusError("TASK_NOT_CLAIMABLE", `task ${opts.task_id} is in state '${row.state}'`);
+  }
+  if (agent !== null && row.required_capability !== null && !agent.capabilities.includes(row.required_capability)) {
+    throw new BusError("TASK_FORBIDDEN", `agent '${opts.to_agent}' lacks capability '${row.required_capability}'`);
+  }
+  const rowScope = JSON.parse(row.edit_scope) as string[];
+  if (opts.allow_conflicts !== true && (row.mode === "edit_files" || row.mode === "propose_patch")) {
+    assertNoScopeConflicts(rowScope, row.project, row.area, opts.task_id, row.team);
+  }
+  const ts = now();
+  if (agent === null) {
+    getDb()
+      .prepare(
+        `UPDATE tasks
+           SET pending_assignee = ?, updated_at = ?
+         WHERE id = ? AND state = 'open' AND claimed_by IS NULL`,
+      )
+      .run(opts.to_agent, ts, opts.task_id);
+    const task = toTask(getTaskRow(opts.task_id));
+    runLocalHook("task.assigned_pending", task);
+    return task;
+  }
+  getDb()
+    .prepare(
+      `UPDATE tasks
+         SET state = 'claimed', claimed_by = ?, pending_assignee = NULL, claimed_at = ?, updated_at = ?
+       WHERE id = ? AND state = 'open' AND claimed_by IS NULL`,
+    )
+    .run(opts.to_agent, ts, ts, opts.task_id);
+  heartbeat(opts.to_agent);
+  const task = toTask(getTaskRow(opts.task_id));
+  send({
+    from: task.requested_by,
+    to: opts.to_agent,
+    content: `assigned task #${task.id}: ${task.title}. Please acknowledge with acknowledge_task.`,
+    thread_id: task.thread_id,
+  });
+  runLocalHook("task.claimed", task);
+  return task;
+}
+
+export interface DelegateOptions extends Omit<CreateTaskOptions, "requested_by"> {
+  from: string;
+  to_agent: string;
+  allow_pending_agent?: boolean;
+}
+
+export interface DelegateResult {
+  task: Task;
+  event: TaskEvent;
+  assigned: boolean;
+  pending: boolean;
+  suggested_next_actions: string[];
+}
+
+export function delegate(opts: DelegateOptions): DelegateResult {
+  const compatibility = legacyCore("delegate", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.from);
+  validateName(opts.to_agent);
+  const task = createTask({
+    ...opts,
+    requested_by: opts.from,
+    ack_required: opts.ack_required ?? true,
+  });
+  const assigned = assignTask({
+    task_id: task.id,
+    to_agent: opts.to_agent,
+    allow_conflicts: opts.allow_conflicts,
+    allow_pending_agent: opts.allow_pending_agent,
+  });
+  const event = recordTaskEvent({
+    by_agent: opts.from,
+    task_id: assigned.id,
+    event_type: "progress",
+    phase: "delegated",
+    message: `Delegated to ${opts.to_agent}`,
+    metadata: {
+      to_agent: opts.to_agent,
+      pending: assigned.pending_assignee !== null,
+    },
+  });
+  return {
+    task: assigned,
+    event,
+    assigned: assigned.claimed_by === opts.to_agent,
+    pending: assigned.pending_assignee === opts.to_agent,
+    suggested_next_actions: [
+      assigned.pending_assignee === opts.to_agent
+        ? `start or register ${opts.to_agent}; pending assignment is reserved`
+        : `wait_for_task ${assigned.id} or watch project_board`,
+      assigned.ack_required && assigned.acknowledged_at === null
+        ? `wait for ${opts.to_agent} to acknowledge task #${assigned.id}`
+        : `track task #${assigned.id}`,
+    ],
+  };
+}
+
+export interface DelegateTeamOptions extends Omit<DelegateOptions, "to_agent" | "allow_pending_agent"> {
+  team?: string;
+  capability?: string;
+  role?: AgentRole;
+  include_self?: boolean;
+  max_recipients?: number;
+}
+
+export interface DelegateTeamResult {
+  team: string;
+  thread_id: string;
+  expected_count: number;
+  delegated_count: number;
+  tasks: DelegateResult[];
+  skipped: TeamSelection["skipped"];
+  suggested_next_actions: string[];
+}
+
+export function delegateTeam(opts: DelegateTeamOptions): DelegateTeamResult {
+  const compatibility = legacyCore("delegate_team", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.from);
+  const selection = selectTeamRecipients({
+    ...opts,
+    project: opts.project ?? undefined,
+    area: opts.area ?? undefined,
+  });
+  if (selection.recipients.length === 0) {
+    throw new BusError("UNKNOWN_AGENT", `no active agent in team '${selection.team}' matches the delegation`);
+  }
+  const maxRecipients = Math.trunc(opts.max_recipients ?? 50);
+  if (!Number.isFinite(maxRecipients) || maxRecipients < 1 || maxRecipients > 100) {
+    throw new BusError("INVALID_INPUT", "max_recipients must be between 1 and 100");
+  }
+  const recipients = selection.recipients.slice(0, maxRecipients);
+  const threadId = opts.thread_id ?? newThreadId();
+  const tasks = recipients.map((recipient) =>
+    delegate({
+      ...opts,
+      to_agent: recipient.name,
+      thread_id: threadId,
+      project: opts.project === undefined ? recipient.project : opts.project,
+      area: opts.area === undefined ? recipient.area : opts.area,
+      team: opts.team === undefined ? recipient.team : opts.team,
+      allow_pending_agent: false,
+    }),
+  );
+  const overflow = selection.recipients.slice(maxRecipients).map((agent) => ({
+    agent: agent.name,
+    reason: "over_limit" as const,
+    presence: agent.presence,
+    age_s: agent.age_s,
+  }));
+  const skipped = [...selection.skipped, ...overflow];
+  return {
+    team: selection.team,
+    thread_id: threadId,
+    expected_count: selection.candidates.length,
+    delegated_count: tasks.length,
+    tasks,
+    skipped,
+    suggested_next_actions: [
+      `created ${tasks.length} tracked task(s) on team '${selection.team}'`,
+      skipped.length > 0
+        ? `inspect skipped recipients before assuming full-team coverage: ${skipped.map((s) => `${s.agent}:${s.reason}`).join(", ")}`
+        : "all matching active team members received tracked tasks",
+      `watch team_board(team="${selection.team}") or agent-bus team-board --team ${selection.team}`,
+    ],
+  };
+}
+
+export interface ClaimBestTaskOptions {
+  agent: string;
+  project?: string;
+  area?: string;
+  team?: string;
+}
+
+export function claimBestTask(opts: ClaimBestTaskOptions): Task | null {
+  const compatibility = legacyCore("claim_best_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  const agent = requireAgent(opts.agent);
+  heartbeat(opts.agent);
+  const project = opts.project !== undefined ? opts.project : agent.project;
+  const area = opts.area !== undefined ? opts.area : agent.area;
+  const team = opts.team !== undefined ? opts.team : agent.team;
+  const tasks = listTasks({
+    state: "open",
+    include_terminal: false,
+    project: project ?? undefined,
+    area: area ?? undefined,
+    team: team ?? undefined,
+    limit: 100,
+  }).filter((task) => task.required_capability === null || agent.capabilities.includes(task.required_capability));
+  const task = tasks.find((candidate) => candidate.pending_assignee === null || candidate.pending_assignee === opts.agent);
+  if (!task) return null;
+  return claimTask({ agent: opts.agent, task_id: task.id });
+}
+
+export interface AcknowledgeTaskOptions {
+  agent: string;
+  task_id: number;
+  response: TaskAckResponse;
+  note?: string | null;
+}
+
+export function acknowledgeTask(opts: AcknowledgeTaskOptions): Task {
+  const compatibility = legacyCore("acknowledge_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  requireAgent(opts.agent);
+  if (!["claimed", "declined", "blocked"].includes(opts.response)) {
+    throw new BusError("INVALID_INPUT", "response must be claimed, declined, or blocked");
+  }
+  heartbeat(opts.agent);
+  const row = getTaskRow(opts.task_id);
+  if (row.claimed_by !== opts.agent && row.requested_by !== opts.agent) {
+    throw new BusError("TASK_FORBIDDEN", `task ${opts.task_id} is held by '${row.claimed_by}'`);
+  }
+  const ts = now();
+  if (opts.response === "declined") {
+    getDb()
+      .prepare(
+        `UPDATE tasks
+           SET state = 'open', claimed_by = NULL, pending_assignee = NULL, claimed_at = NULL, acknowledged_at = ?, acknowledged_by = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(ts, opts.agent, ts, opts.task_id);
+  } else if (opts.response === "blocked") {
+    getDb()
+      .prepare(
+        `UPDATE tasks
+           SET state = 'blocked', blocked_reason = ?, acknowledged_at = ?, acknowledged_by = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(opts.note ?? "acknowledged blocked", ts, opts.agent, ts, opts.task_id);
+  } else {
+    getDb()
+      .prepare("UPDATE tasks SET acknowledged_at = ?, acknowledged_by = ?, updated_at = ? WHERE id = ?")
+      .run(ts, opts.agent, ts, opts.task_id);
+  }
+  const task = toTask(getTaskRow(opts.task_id));
+  if (task.requested_by !== opts.agent) {
+    send({
+      from: opts.agent,
+      to: task.requested_by,
+      content: `acknowledged task #${task.id}: ${opts.response}${opts.note ? ` - ${opts.note}` : ""}`,
+      thread_id: task.thread_id,
+    });
+  }
+  return task;
+}
+
+export interface SubmitReviewOptions {
+  reviewer: string;
+  task_id: number;
+  approved: boolean;
+  notes?: string | null;
+}
+
+export function submitReview(opts: SubmitReviewOptions): Task {
+  const compatibility = legacyCore("submit_review", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.reviewer);
+  requireAgent(opts.reviewer);
+  heartbeat(opts.reviewer);
+  const row = getTaskRow(opts.task_id);
+  if (row.independent_review === 1 && (row.claimed_by === opts.reviewer || row.pending_assignee === opts.reviewer)) {
+    throw new BusError(
+      "REVIEW_SELF_FORBIDDEN",
+      `task ${opts.task_id} requires independent review; '${opts.reviewer}' is the implementer/assignee. Have a different agent review, or disable independent_review for solo work.`,
+    );
+  }
+  const ts = now();
+  const reviewState: TaskReviewState = opts.approved ? "approved" : "changes_requested";
+  getDb()
+    .prepare(
+      `UPDATE tasks
+         SET review_required = 1, review_state = ?, reviewed_by = ?, review_notes = ?, manager_reviewed = ?, updated_at = ?
+       WHERE id = ?`,
+    )
+    .run(reviewState, opts.reviewer, opts.notes ?? null, opts.approved ? 1 : 0, ts, opts.task_id);
+  const task = toTask(getTaskRow(opts.task_id));
+  const recipient = row.claimed_by ?? row.requested_by;
+  if (recipient !== opts.reviewer) {
+    send({
+      from: opts.reviewer,
+      to: recipient,
+      content: `review ${reviewState} for task #${task.id}${opts.notes ? `: ${opts.notes}` : ""}`,
+      thread_id: task.thread_id,
+    });
+  }
+  notifyTaskRequester(task, opts.reviewer, `review ${reviewState} for task #${task.id}${opts.notes ? `: ${opts.notes}` : ""}`);
+  return task;
+}
+
+export interface HandoffTaskOptions {
+  from_agent: string;
+  task_id: number;
+  to_agent?: string | null;
+  reason: string;
+  memory?: string | null;
+}
+
+export function handoffTask(opts: HandoffTaskOptions): { task: Task; memory: Memory | null; message: Message | null } {
+  const compatibility = legacyCore("handoff_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.from_agent);
+  requireAgent(opts.from_agent);
+  if (opts.to_agent !== undefined && opts.to_agent !== null) validateName(opts.to_agent);
+  if (opts.reason.trim().length === 0) throw new BusError("INVALID_INPUT", "reason must be non-empty");
+  const task = getTask(opts.task_id);
+  if (task.claimed_by !== opts.from_agent && task.requested_by !== opts.from_agent) {
+    throw new BusError("TASK_FORBIDDEN", `task ${opts.task_id} is held by '${task.claimed_by}'`);
+  }
+  const memory = opts.memory === null
+    ? null
+    : remember({
+        by_agent: opts.from_agent,
+        agent: opts.to_agent ?? task.claimed_by,
+        kind: "handoff",
+        content: opts.memory ?? `Task #${task.id} handoff: ${opts.reason}`,
+        task_id: task.id,
+        thread_id: task.thread_id,
+        pinned: true,
+        project: task.project,
+        area: task.area,
+      });
+  let updated = task;
+  let message: Message | null = null;
+  if (opts.to_agent) {
+    if (task.claimed_by !== null) {
+      releaseTask({ agent: opts.from_agent, task_id: task.id });
+    }
+    updated = assignTask({ task_id: task.id, to_agent: opts.to_agent, allow_conflicts: true });
+    message = send({
+      from: opts.from_agent,
+      to: opts.to_agent,
+      content: `handoff task #${task.id}: ${opts.reason}`,
+      thread_id: task.thread_id,
+    });
+  } else if (task.claimed_by !== null) {
+    updated = releaseTask({ agent: opts.from_agent, task_id: task.id });
+  }
+  return { task: updated, memory, message };
+}
+
+export function getTask(id: number): Task {
+  const compatibility = legacyCore('get_task', {task_id:id});
+  if (compatibility.handled) return compatibility.value;
+  const row = getTaskRow(id);
+  return toTask(row, lastSeenMap());
+}
+
+export function tasksUpdatedSince(timestamp: number, limit = 100): Task[] {
+  const compatibility = legacyCore("tasksUpdatedSince", timestamp);
+  if (compatibility.handled) return compatibility.value;
+  const rows = getDb()
+    .prepare("SELECT * FROM tasks WHERE updated_at > ? ORDER BY updated_at ASC, id ASC LIMIT ?")
+    .all(timestamp, Math.min(Math.max(limit, 1), 500)) as TaskRow[];
+  const seen = lastSeenMap();
+  return rows.map((r) => toTask(r, seen));
+}
+
+export interface TaskEvent {
+  id: number;
+  task_id: number;
+  by_agent: string;
+  event_type: TaskEventType;
+  message: string;
+  phase: string | null;
+  metadata: Record<string, unknown>;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  created_at: number;
+}
+
+interface TaskEventRow {
+  id: number;
+  task_id: number;
+  by_agent: string;
+  event_type: TaskEventType;
+  message: string;
+  phase: string | null;
+  metadata: string;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  created_at: number;
+}
+
+function toTaskEvent(row: TaskEventRow): TaskEvent {
+  return {
+    ...row,
+    metadata: JSON.parse(row.metadata) as Record<string, unknown>,
+  };
+}
+
+export interface RecordTaskEventOptions {
+  by_agent: string;
+  task_id: number;
+  event_type?: TaskEventType;
+  message: string;
+  phase?: string | null;
+  metadata?: Record<string, unknown>;
+}
+
+export function recordTaskEvent(opts: RecordTaskEventOptions): TaskEvent {
+  const compatibility = legacyCore("record_task_event", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.by_agent);
+  validateTaskEventType(opts.event_type);
+  requireAgent(opts.by_agent);
+  heartbeat(opts.by_agent);
+  const task = getTask(opts.task_id);
+  if (opts.message.trim().length === 0) throw new BusError("INVALID_INPUT", "message must be non-empty");
+  if (opts.phase !== undefined && opts.phase !== null && opts.phase.trim().length === 0) {
+    throw new BusError("INVALID_INPUT", "phase must be non-empty or null");
+  }
+  const eventType = opts.event_type ?? (opts.phase ? "phase" : "note");
+  const metadata = opts.metadata ?? {};
+  if (metadata === null || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new BusError("INVALID_INPUT", "metadata must be an object");
+  }
+  const ts = now();
+  const info = getDb()
+    .prepare(
+      `INSERT INTO task_events (task_id, by_agent, event_type, message, phase, metadata, project, area, team, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(opts.task_id, opts.by_agent, eventType, opts.message, opts.phase ?? null, JSON.stringify(metadata), task.project, task.area, task.team, ts);
+  if (opts.phase !== undefined) {
+    getDb().prepare("UPDATE tasks SET phase = ?, updated_at = ? WHERE id = ?").run(opts.phase, ts, opts.task_id);
+  }
+  const row = getDb().prepare("SELECT * FROM task_events WHERE id = ?").get(info.lastInsertRowid) as TaskEventRow;
+  return toTaskEvent(row);
+}
+
+export interface ListTaskEventsOptions {
+  task_id?: number;
+  by_agent?: string;
+  event_type?: TaskEventType;
+  project?: string;
+  area?: string;
+  team?: string;
+  limit?: number;
+}
+
+export function listTaskEvents(opts: ListTaskEventsOptions = {}): TaskEvent[] {
+  const compatibility = legacyCore("list_task_events", opts);
+  if (compatibility.handled) return compatibility.value;
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) validateProject(opts.project);
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) validateArea(opts.area);
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) validateTeam(opts.team);
+  validateTaskEventType(opts.event_type);
+  if (opts.by_agent !== undefined) validateName(opts.by_agent);
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (opts.task_id !== undefined) {
+    where.push("task_id = ?");
+    params.push(opts.task_id);
+  }
+  if (opts.by_agent !== undefined) {
+    where.push("by_agent = ?");
+    params.push(opts.by_agent);
+  }
+  if (opts.event_type !== undefined) {
+    where.push("event_type = ?");
+    params.push(opts.event_type);
+  }
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    where.push("project = ?");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    where.push("area = ?");
+    params.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) {
+    where.push("team = ?");
+    params.push(opts.team);
+  }
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
+  const rows = getDb()
+    .prepare(`SELECT * FROM task_events${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY id DESC LIMIT ?`)
+    .all(...params, limit) as TaskEventRow[];
+  return rows.reverse().map(toTaskEvent);
+}
+
+export interface TaskResult {
+  task: Task;
+  events: TaskEvent[];
+  test_results: TestResult[];
+  memories: Memory[];
+  messages: Message[];
+}
+
+export function taskResult(taskId: number, limit = 100): TaskResult {
+  const compatibility = legacyCore('task_result', {task_id:taskId,limit});
+  if (compatibility.handled) return compatibility.value;
+  const task = getTask(taskId);
+  const bounded = Math.min(Math.max(limit, 1), 500);
+  return {
+    task,
+    events: listTaskEvents({ task_id: taskId, limit: bounded }),
+    test_results: listTestResults({ task_id: taskId, limit: bounded }),
+    memories: listMemories({ task_id: taskId, limit: bounded }),
+    messages: threadMessages(task.thread_id, bounded),
+  };
+}
+
+export interface WaitForTaskOptions {
+  task_id: number;
+  wait_s?: number;
+  since_updated_at?: number;
+  limit?: number;
+}
+
+export interface WaitForTaskResult extends TaskResult {
+  timed_out: boolean;
+  holder: AgentDirectoryEntry | null;
+  latest_event: TaskEvent | null;
+  latest_message: Message | null;
+  latest_test_result: TestResult | null;
+  suggested_next_actions: string[];
+}
+
+export async function waitForTask(opts: WaitForTaskOptions): Promise<WaitForTaskResult> {
+  const compatibility = legacyCore("wait_for_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  const waitMs = Math.min(Math.max(opts.wait_s ?? 110, 0), MAX_INBOX_WAIT_S) * 1000;
+  const startTask = getTask(opts.task_id);
+  const since = opts.since_updated_at ?? startTask.updated_at;
+  const deadline = now() + waitMs;
+  let timedOut = false;
+
+  while (true) {
+    const current = getTask(opts.task_id);
+    const result = taskResult(opts.task_id, opts.limit ?? 50);
+    const latestEvent = result.events.at(-1) ?? null;
+    const latestMessage = result.messages.at(-1) ?? null;
+    const latestTestResult = result.test_results.at(-1) ?? null;
+    const hasActivity =
+      current.updated_at > since ||
+      (latestEvent !== null && latestEvent.created_at > since) ||
+      (latestMessage !== null && latestMessage.created_at > since) ||
+      (latestTestResult !== null && latestTestResult.created_at > since) ||
+      TERMINAL_TASK_STATES.includes(current.state);
+    if (hasActivity || waitMs === 0) {
+      return decorateWaitForTask(result, timedOut);
+    }
+    if (now() >= deadline) {
+      timedOut = true;
+      return decorateWaitForTask(result, timedOut);
+    }
+    await sleep(POLL_INTERVAL_MS);
+  }
+}
+
+function decorateWaitForTask(result: TaskResult, timedOut: boolean): WaitForTaskResult {
+  const holder = result.task.claimed_by
+    ? directory({ project: PROJECT_WILDCARD, area: AREA_WILDCARD }).find((agent) => agent.name === result.task.claimed_by) ?? null
+    : null;
+  const latestEvent = result.events.at(-1) ?? null;
+  const latestMessage = result.messages.at(-1) ?? null;
+  const latestTestResult = result.test_results.at(-1) ?? null;
+  const suggested: string[] = [];
+  if (timedOut) suggested.push("No task update before timeout; check holder presence or project_board.");
+  if (result.task.pending_assignee) suggested.push(`Start/register ${result.task.pending_assignee}; assignment is pending.`);
+  if (result.task.ack_required && result.task.acknowledged_at === null) suggested.push("Task still needs acknowledgement.");
+  if (result.task.state === "blocked") suggested.push("Resolve blocker or reassign/release the task.");
+  if (result.task.stale === true) suggested.push("Holder appears stale; consider handoff_task or release_task.");
+  if (result.task.review_required && result.task.review_state !== "approved") suggested.push("Task requires approved review before completion.");
+  if (TERMINAL_TASK_STATES.includes(result.task.state)) suggested.push("Task is terminal; inspect task_result/final_report.");
+  if (suggested.length === 0) suggested.push("Continue waiting or inspect latest task events.");
+  return {
+    ...result,
+    timed_out: timedOut,
+    holder,
+    latest_event: latestEvent,
+    latest_message: latestMessage,
+    latest_test_result: latestTestResult,
+    suggested_next_actions: suggested,
+  };
+}
+
+export interface CancelTaskOptions {
+  agent: string;
+  task_id: number;
+  reason?: string | null;
+}
+
+export interface CancelTaskResult {
+  task: Task;
+  event: TaskEvent;
+}
+
+export function cancelTask(opts: CancelTaskOptions): CancelTaskResult {
+  const compatibility = legacyCore("cancel_task", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  requireAgent(opts.agent);
+  heartbeat(opts.agent);
+  const row = getTaskRow(opts.task_id);
+  if (row.requested_by !== opts.agent && row.claimed_by !== opts.agent) {
+    throw new BusError("TASK_FORBIDDEN", "only the requester or current holder can cancel a task");
+  }
+  if (TERMINAL_TASK_STATES.includes(row.state)) {
+    throw new BusError("TASK_INVALID_TRANSITION", `task ${opts.task_id} is already in terminal state '${row.state}'`);
+  }
+  const ts = now();
+  getDb()
+    .prepare(
+      `UPDATE tasks
+         SET state = 'canceled', phase = 'canceled', result = COALESCE(?, result), finished_at = ?, updated_at = ?
+       WHERE id = ?`,
+    )
+    .run(opts.reason ?? null, ts, ts, opts.task_id);
+  const event = recordTaskEvent({
+    by_agent: opts.agent,
+    task_id: opts.task_id,
+    event_type: "cancel",
+    phase: "canceled",
+    message: opts.reason ?? "Task canceled",
+  });
+  const task = getTask(opts.task_id);
+  if (task.claimed_by && task.claimed_by !== opts.agent) {
+    send({ from: opts.agent, to: task.claimed_by, content: `canceled task #${task.id}: ${task.title}`, thread_id: task.thread_id });
+  }
+  if (task.requested_by !== opts.agent) {
+    send({ from: opts.agent, to: task.requested_by, content: `canceled task #${task.id}: ${task.title}`, thread_id: task.thread_id });
+  }
+  runLocalHook("task.canceled", task);
+  return { task, event };
+}
+
+// ---------------------------------------------------------------------------
+// Decisions and reports
+// ---------------------------------------------------------------------------
+
+export interface Decision {
+  id: number;
+  by_agent: string;
+  decision: string;
+  rationale: string | null;
+  implemented: boolean;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface DecisionRow {
+  id: number;
+  by_agent: string;
+  decision: string;
+  rationale: string | null;
+  implemented: number;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+function toDecision(row: DecisionRow): Decision {
+  return {
+    ...row,
+    implemented: row.implemented === 1,
+  };
+}
+
+export interface TestResult {
+  id: number;
+  by_agent: string;
+  task_id: number | null;
+  command: string;
+  status: TestResultStatus;
+  output_summary: string | null;
+  git_ref: string | null;
+  cwd: string | null;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  created_at: number;
+}
+
+interface TestResultRow {
+  id: number;
+  by_agent: string;
+  task_id: number | null;
+  command: string;
+  status: TestResultStatus;
+  output_summary: string | null;
+  git_ref: string | null;
+  cwd: string | null;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  created_at: number;
+}
+
+function toTestResult(row: TestResultRow): TestResult {
+  return { ...row };
+}
+
+export interface RecordDecisionOptions {
+  by_agent: string;
+  decision: string;
+  rationale?: string | null;
+  implemented?: boolean;
+  project?: string | null;
+  area?: string | null;
+  team?: string | null;
+}
+
+export function recordDecision(opts: RecordDecisionOptions): Decision {
+  const compatibility = legacyCore("record_decision", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.by_agent);
+  validateProject(opts.project);
+  validateArea(opts.area);
+  validateTeam(opts.team);
+  const agent = requireAgent(opts.by_agent);
+  if (opts.decision.trim().length === 0) {
+    throw new BusError("INVALID_INPUT", "decision must be non-empty");
+  }
+  const ts = now();
+  const project = opts.project !== undefined ? opts.project : agent.project;
+  const area = opts.area !== undefined ? opts.area : agent.area;
+  const team = opts.team !== undefined ? opts.team : agent.team;
+  const info = getDb()
+    .prepare(
+      `INSERT INTO decisions
+         (by_agent, decision, rationale, implemented, project, area, team, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      opts.by_agent,
+      opts.decision,
+      opts.rationale ?? null,
+      opts.implemented === true ? 1 : 0,
+      project,
+      area,
+      team,
+      ts,
+      ts,
+    );
+  return toDecision(
+    getDb().prepare("SELECT * FROM decisions WHERE id = ?").get(info.lastInsertRowid as number) as DecisionRow,
+  );
+}
+
+export interface ListDecisionsOptions {
+  project?: string;
+  area?: string;
+  team?: string;
+  implemented?: boolean;
+  since?: number;
+  limit?: number;
+}
+
+export function listDecisions(opts: ListDecisionsOptions = {}): Decision[] {
+  const compatibility = legacyCore("list_decisions", opts);
+  if (compatibility.handled) return compatibility.value;
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    validateProject(opts.project);
+    where.push("(project = ? OR project IS NULL)");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    validateArea(opts.area);
+    where.push("(area = ? OR area IS NULL)");
+    params.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) {
+    validateTeam(opts.team);
+    where.push("team = ?");
+    params.push(opts.team);
+  }
+  if (opts.implemented !== undefined) {
+    where.push("implemented = ?");
+    params.push(opts.implemented ? 1 : 0);
+  }
+  if (opts.since !== undefined) {
+    where.push("created_at >= ?");
+    params.push(opts.since);
+  }
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM decisions${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY id DESC
+         LIMIT ?`,
+    )
+    .all(...params, limit) as DecisionRow[];
+  return rows.reverse().map(toDecision);
+}
+
+export interface RecordTestResultOptions {
+  by_agent: string;
+  task_id?: number | null;
+  command: string;
+  status: TestResultStatus;
+  output_summary?: string | null;
+  git_ref?: string | null;
+  cwd?: string | null;
+  project?: string | null;
+  area?: string | null;
+  team?: string | null;
+}
+
+export function recordTestResult(opts: RecordTestResultOptions): TestResult {
+  const compatibility = legacyCore("record_test_result", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.by_agent);
+  validateTestResultStatus(opts.status);
+  validateProject(opts.project);
+  validateArea(opts.area);
+  validateTeam(opts.team);
+  const agent = requireAgent(opts.by_agent);
+  if (opts.command.trim().length === 0) throw new BusError("INVALID_INPUT", "command must be non-empty");
+  let project = opts.project !== undefined ? opts.project : agent.project;
+  let area = opts.area !== undefined ? opts.area : agent.area;
+  let team = opts.team !== undefined ? opts.team : agent.team;
+  if (opts.task_id !== undefined && opts.task_id !== null) {
+    const task = getTask(opts.task_id);
+    project = opts.project !== undefined ? opts.project : task.project;
+    area = opts.area !== undefined ? opts.area : task.area;
+    team = opts.team !== undefined ? opts.team : task.team;
+  }
+  const ts = now();
+  const info = getDb()
+    .prepare(
+      `INSERT INTO test_results (by_agent, task_id, command, status, output_summary, git_ref, cwd, project, area, team, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(opts.by_agent, opts.task_id ?? null, opts.command, opts.status, opts.output_summary ?? null, opts.git_ref ?? null, opts.cwd ?? null, project, area, team, ts);
+  const row = getDb().prepare("SELECT * FROM test_results WHERE id = ?").get(info.lastInsertRowid) as TestResultRow;
+  return toTestResult(row);
+}
+
+export interface ListTestResultsOptions {
+  task_id?: number;
+  by_agent?: string;
+  status?: TestResultStatus;
+  project?: string;
+  area?: string;
+  team?: string;
+  limit?: number;
+}
+
+export function listTestResults(opts: ListTestResultsOptions = {}): TestResult[] {
+  const compatibility = legacyCore("list_test_results", opts);
+  if (compatibility.handled) return compatibility.value;
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) validateProject(opts.project);
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) validateArea(opts.area);
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) validateTeam(opts.team);
+  validateTestResultStatus(opts.status);
+  if (opts.by_agent !== undefined) validateName(opts.by_agent);
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (opts.task_id !== undefined) {
+    where.push("task_id = ?");
+    params.push(opts.task_id);
+  }
+  if (opts.by_agent !== undefined) {
+    where.push("by_agent = ?");
+    params.push(opts.by_agent);
+  }
+  if (opts.status !== undefined) {
+    where.push("status = ?");
+    params.push(opts.status);
+  }
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    where.push("project = ?");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    where.push("area = ?");
+    params.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) {
+    where.push("team = ?");
+    params.push(opts.team);
+  }
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
+  const rows = getDb()
+    .prepare(`SELECT * FROM test_results${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at DESC, id DESC LIMIT ?`)
+    .all(...params, limit) as TestResultRow[];
+  return rows.map(toTestResult);
+}
+
+export interface Memory {
+  id: number;
+  by_agent: string;
+  agent: string | null;
+  kind: MemoryKind;
+  content: string;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  task_id: number | null;
+  thread_id: string | null;
+  pinned: boolean;
+  supersedes_id: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+interface MemoryRow {
+  id: number;
+  by_agent: string;
+  agent: string | null;
+  kind: MemoryKind;
+  content: string;
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  task_id: number | null;
+  thread_id: string | null;
+  pinned: number;
+  supersedes_id: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+function toMemory(row: MemoryRow): Memory {
+  return {
+    ...row,
+    pinned: row.pinned === 1,
+  };
+}
+
+export interface RememberOptions {
+  by_agent: string;
+  kind: MemoryKind;
+  content: string;
+  agent?: string | null;
+  project?: string | null;
+  area?: string | null;
+  team?: string | null;
+  task_id?: number | null;
+  thread_id?: string | null;
+  pinned?: boolean;
+  supersedes_id?: number | null;
+}
+
+export function remember(opts: RememberOptions): Memory {
+  const compatibility = legacyCore("remember", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.by_agent);
+  validateMemoryKind(opts.kind);
+  validateProject(opts.project);
+  validateArea(opts.area);
+  validateTeam(opts.team);
+  const byAgent = requireAgent(opts.by_agent);
+  if (opts.agent !== undefined && opts.agent !== null) validateName(opts.agent);
+  if (opts.content.trim().length === 0) {
+    throw new BusError("INVALID_INPUT", "content must be non-empty");
+  }
+  if (opts.task_id !== undefined && opts.task_id !== null) {
+    getTaskRow(opts.task_id);
+  }
+  if (opts.supersedes_id !== undefined && opts.supersedes_id !== null) {
+    const exists = getDb()
+      .prepare("SELECT 1 FROM memories WHERE id = ?")
+      .get(opts.supersedes_id);
+    if (!exists) throw new BusError("INVALID_INPUT", `supersedes_id ${opts.supersedes_id} does not exist`);
+  }
+  const ts = now();
+  const project = opts.project !== undefined ? opts.project : byAgent.project;
+  const area = opts.area !== undefined ? opts.area : byAgent.area;
+  const team = opts.team !== undefined ? opts.team : byAgent.team;
+  const info = getDb()
+    .prepare(
+      `INSERT INTO memories
+         (by_agent, agent, kind, content, project, area, team, task_id, thread_id, pinned, supersedes_id, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      opts.by_agent,
+      opts.agent ?? null,
+      opts.kind,
+      opts.content,
+      project,
+      area,
+      team,
+      opts.task_id ?? null,
+      opts.thread_id ?? null,
+      opts.pinned === true ? 1 : 0,
+      opts.supersedes_id ?? null,
+      ts,
+      ts,
+    );
+  return toMemory(
+    getDb().prepare("SELECT * FROM memories WHERE id = ?").get(info.lastInsertRowid as number) as MemoryRow,
+  );
+}
+
+export interface ListMemoriesOptions {
+  project?: string;
+  area?: string;
+  team?: string;
+  agent?: string;
+  kind?: MemoryKind;
+  task_id?: number;
+  thread_id?: string;
+  pinned?: boolean;
+  since?: number;
+  limit?: number;
+}
+
+export function listMemories(opts: ListMemoriesOptions = {}): Memory[] {
+  const compatibility = legacyCore("list_memories", opts);
+  if (compatibility.handled) return compatibility.value;
+  const where: string[] = [];
+  const params: unknown[] = [];
+  if (opts.project !== undefined && opts.project !== PROJECT_WILDCARD) {
+    validateProject(opts.project);
+    where.push("(project = ? OR project IS NULL)");
+    params.push(opts.project);
+  }
+  if (opts.area !== undefined && opts.area !== AREA_WILDCARD) {
+    validateArea(opts.area);
+    where.push("(area = ? OR area IS NULL)");
+    params.push(opts.area);
+  }
+  if (opts.team !== undefined && opts.team !== TEAM_WILDCARD) {
+    validateTeam(opts.team);
+    where.push("team = ?");
+    params.push(opts.team);
+  }
+  if (opts.agent !== undefined) {
+    validateName(opts.agent);
+    where.push("(agent = ? OR by_agent = ?)");
+    params.push(opts.agent, opts.agent);
+  }
+  if (opts.kind !== undefined) {
+    validateMemoryKind(opts.kind);
+    where.push("kind = ?");
+    params.push(opts.kind);
+  }
+  if (opts.task_id !== undefined) {
+    where.push("task_id = ?");
+    params.push(opts.task_id);
+  }
+  if (opts.thread_id !== undefined) {
+    where.push("thread_id = ?");
+    params.push(opts.thread_id);
+  }
+  if (opts.pinned !== undefined) {
+    where.push("pinned = ?");
+    params.push(opts.pinned ? 1 : 0);
+  }
+  if (opts.since !== undefined) {
+    where.push("created_at >= ?");
+    params.push(opts.since);
+  }
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 500);
+  const rows = getDb()
+    .prepare(
+      `SELECT * FROM memories${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
+         ORDER BY id DESC
+         LIMIT ?`,
+    )
+    .all(...params, limit) as MemoryRow[];
+  return rows.reverse().map(toMemory);
+}
+
+export function pinMemory(id: number, pinned: boolean): Memory {
+  const compatibility = legacyCore(pinned?'pin_memory':'unpin_memory', {memory_id:id});
+  if (compatibility.handled) return compatibility.value;
+  const ts = now();
+  const info = getDb()
+    .prepare("UPDATE memories SET pinned = ?, updated_at = ? WHERE id = ?")
+    .run(pinned ? 1 : 0, ts, id);
+  if (info.changes === 0) {
+    throw new BusError("INVALID_INPUT", `memory ${id} does not exist`);
+  }
+  return toMemory(getDb().prepare("SELECT * FROM memories WHERE id = ?").get(id) as MemoryRow);
+}
+
+export interface SessionBriefOptions {
+  project?: string;
+  area?: string;
+  team?: string;
+  agent?: string;
+  limit?: number;
+  recent_window_ms?: number;
+}
+
+export interface SessionBrief {
+  project: string | null;
+  area: string | null;
+  team: string | null;
+  agent: string | null;
+  active_agents: AgentDirectoryEntry[];
+  backlog_tasks: Task[];
+  open_tasks: Task[];
+  blocked_tasks: Task[];
+  stale_tasks: Task[];
+  recent_decisions: Decision[];
+  pinned_memories: Memory[];
+  recent_memories: Memory[];
+  recent_messages: Message[];
+  suggested_next_actions: string[];
+}
+
+export interface ProjectBoard {
+  agents: AgentDirectoryEntry[];
+  backlog_tasks: Task[];
+  open_tasks: Task[];
+  active_tasks: Task[];
+  blocked_tasks: Task[];
+  waiting_review: Task[];
+  waiting_acknowledgement: Task[];
+  stale_tasks: Task[];
+  overdue_tasks: Task[];
+  checkin_due_tasks: Task[];
+  scope_conflicts: Array<{ task_id: number; title: string; conflicts: ScopeConflict[] }>;
+  pinned_risks: Memory[];
+  pinned_handoffs: Memory[];
+  suggested_next_actions: string[];
+}
+
+export function sessionBrief(opts: SessionBriefOptions = {}): SessionBrief {
+  const compatibility = legacyCore("session_brief", opts);
+  if (compatibility.handled) return compatibility.value;
+  if (opts.agent !== undefined) validateName(opts.agent);
+  const limit = Math.min(Math.max(opts.limit ?? 10, 1), 50);
+  const recentWindowMs = Math.min(Math.max(opts.recent_window_ms ?? 7 * 24 * 60 * 60 * 1000, 0), 365 * 24 * 60 * 60 * 1000);
+  const ts = now();
+  const recentSince = recentWindowMs === 0 ? ts + 1 : ts - recentWindowMs;
+  const scope = { project: opts.project, area: opts.area, team: opts.team };
+  const activeAgents = directory(scope).filter((agent) => agent.presence !== "stale");
+  const tasks = listTasks({ ...scope, include_terminal: false, limit: 500 });
+  const backlogTasks = tasks.filter((task) => task.state === "backlog").slice(0, limit);
+  const openTasks = tasks.filter((task) => task.state === "open").slice(0, limit);
+  const blockedTasks = tasks.filter((task) => task.state === "blocked").slice(0, limit);
+  const staleTasks = tasks.filter((task) => task.stale === true).slice(0, limit);
+  const recentDecisions = listDecisions({ ...scope, since: recentSince, limit });
+  const pinnedMemories = listMemories({ ...scope, agent: opts.agent, pinned: true, limit: 10 })
+    .slice()
+    .sort((a, b) => {
+      const rank = (m: Memory): number => m.kind === "handoff" ? 0 : m.kind === "risk" ? 1 : 2;
+      return rank(a) - rank(b) || b.created_at - a.created_at;
+    });
+  const recentMemories = listMemories({ ...scope, agent: opts.agent, pinned: false, since: recentSince, limit });
+  const recent = recentMessages({ ...scope, since: recentSince, limit });
+  const suggested: string[] = [];
+  if (blockedTasks.length > 0) suggested.push("Review blocked tasks and record the unblocker or release/reassign ownership.");
+  if (staleTasks.length > 0) suggested.push("Check stale task holders before continuing or reassigning their work.");
+  if (openTasks.length > 0) suggested.push("Assign or claim the highest-priority open task with an explicit mode and file scope.");
+  if (backlogTasks.length > 0 && openTasks.length === 0) suggested.push("Promote a backlog item to open when the team is ready to work it.");
+  if (pinnedMemories.length === 0 && recentMemories.length === 0) suggested.push("Record a handoff, risk, or todo memory before ending the session.");
+  if (activeAgents.length === 0) suggested.push("Register or wake the agents needed for this project/area.");
+
+  return {
+    project: opts.project ?? null,
+    area: opts.area ?? null,
+    team: opts.team ?? null,
+    agent: opts.agent ?? null,
+    active_agents: activeAgents.slice(0, limit),
+    backlog_tasks: backlogTasks,
+    open_tasks: openTasks,
+    blocked_tasks: blockedTasks,
+    stale_tasks: staleTasks,
+    recent_decisions: recentDecisions,
+    pinned_memories: pinnedMemories,
+    recent_memories: recentMemories,
+    recent_messages: recent,
+    suggested_next_actions: suggested,
+  };
+}
+
+export function projectBoard(opts: SessionBriefOptions = {}): ProjectBoard {
+  const compatibility = legacyCore("project_board", opts);
+  if (compatibility.handled) return compatibility.value;
+  const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
+  const scope = { project: opts.project, area: opts.area, team: opts.team };
+  const agents = directory(scope).slice(0, limit);
+  const tasks = listTasks({ ...scope, include_terminal: false, limit: 500 });
+  const backlogTasks = tasks.filter((task) => task.state === "backlog").slice(0, limit);
+  const openTasks = tasks.filter((task) => task.state === "open").slice(0, limit);
+  const activeTasks = tasks.filter((task) => ["claimed", "working"].includes(task.state)).slice(0, limit);
+  const blockedTasks = tasks.filter((task) => task.state === "blocked").slice(0, limit);
+  const waitingReview = tasks
+    .filter((task) => task.review_required && task.review_state === "pending")
+    .slice(0, limit);
+  const waitingAck = tasks
+    .filter((task) => task.ack_required && task.acknowledged_at === null && (task.pending_assignee !== null || task.claimed_by !== null))
+    .slice(0, limit);
+  const staleTasks = tasks.filter((task) => task.stale === true).slice(0, limit);
+  const ts = now();
+  const overdueTasks = tasks
+    .filter((task) => task.deadline_at !== null && task.deadline_at < ts && DEADLINE_ATTENTION_STATES.includes(task.state))
+    .map((task) => ({ ...task, overdue: true }))
+    .slice(0, limit);
+  const checkinDueTasks = tasks
+    .filter((task) => task.checkin_at !== null && task.checkin_at < ts && CHECKIN_ATTENTION_STATES.includes(task.state))
+    .map((task) => ({ ...task, checkin_due: true }))
+    .slice(0, limit);
+  const scopeConflicts = tasks
+    .filter((task) => task.edit_scope.length > 0 && (task.state === "claimed" || task.state === "working" || task.state === "blocked"))
+    .map((task) => ({
+      task_id: task.id,
+      title: task.title,
+      conflicts: checkScopeConflicts({
+        edit_scope: task.edit_scope,
+        project: task.project,
+        area: task.area,
+        team: task.team,
+        exclude_task_id: task.id,
+      }),
+    }))
+    .filter((row) => row.conflicts.length > 0)
+    .slice(0, limit);
+  const pinnedRisks = listMemories({ ...scope, kind: "risk", pinned: true, limit });
+  const pinnedHandoffs = listMemories({ ...scope, kind: "handoff", pinned: true, limit });
+  const suggested: string[] = [];
+  if (scopeConflicts.length > 0) suggested.push("Resolve overlapping edit_scope before allowing more edits.");
+  if (overdueTasks.length > 0) suggested.push("Review overdue tasks and update deadlines, blockers, or ownership.");
+  if (checkinDueTasks.length > 0) suggested.push("Ask task holders for due check-ins or record current progress.");
+  if (waitingAck.length > 0) suggested.push("Follow up with agents who have not acknowledged assigned work.");
+  if (blockedTasks.length > 0) suggested.push("Review blocked tasks and update blockers or release ownership.");
+  if (waitingReview.length > 0) suggested.push("Assign a verifier to pending review tasks.");
+  if (staleTasks.length > 0) suggested.push("Check stale task holders and reassign or release if needed.");
+  if (openTasks.length > 0) suggested.push("Assign or claim open tasks with explicit mode and file_scope.");
+  return {
+    agents,
+    backlog_tasks: backlogTasks,
+    open_tasks: openTasks,
+    active_tasks: activeTasks,
+    blocked_tasks: blockedTasks,
+    waiting_review: waitingReview,
+    stale_tasks: staleTasks,
+    overdue_tasks: overdueTasks,
+    checkin_due_tasks: checkinDueTasks,
+    waiting_acknowledgement: waitingAck,
+    scope_conflicts: scopeConflicts,
+    pinned_risks: pinnedRisks,
+    pinned_handoffs: pinnedHandoffs,
+    suggested_next_actions: suggested,
+  };
+}
+
+export interface TeamBoardOptions extends SessionBriefOptions {
+  team: string;
+}
+
+export function teamBoard(opts: TeamBoardOptions): ProjectBoard {
+  const compatibility = legacyCore("team_board", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateTeam(opts.team);
+  return projectBoard({ ...opts, team: opts.team });
+}
+
+export type ActivityItem =
+  | {
+      source: "message";
+      at: number;
+      id: number;
+      summary: string;
+      message: Message;
+    }
+  | {
+      source: "task_event";
+      at: number;
+      id: number;
+      summary: string;
+      event: TaskEvent;
+    }
+  | {
+      source: "test_result";
+      at: number;
+      id: number;
+      summary: string;
+      test_result: TestResult;
+    }
+  | {
+      source: "decision";
+      at: number;
+      id: number;
+      summary: string;
+      decision: Decision;
+    }
+  | {
+      source: "memory";
+      at: number;
+      id: number;
+      summary: string;
+      memory: Memory;
+    };
+
+export interface ActivityOptions extends SessionBriefOptions {
+  since?: number;
+}
+
+export function activityTimeline(opts: ActivityOptions = {}): ActivityItem[] {
+  const compatibility = legacyCore("activity", opts);
+  if (compatibility.handled) return compatibility.value;
+  const limit = Math.min(Math.max(opts.limit ?? 50, 1), 200);
+  const scope = { project: opts.project, area: opts.area, team: opts.team };
+  const since = opts.since ?? 0;
+  const items: ActivityItem[] = [];
+
+  for (const message of recentMessages({ ...scope, limit })) {
+    if (message.created_at < since) continue;
+    items.push({
+      source: "message",
+      at: message.created_at,
+      id: message.id,
+      summary: `${message.from_agent} ${message.kind === "ask" ? "asked" : message.kind === "reply" ? "replied to" : "messaged"} ${message.to_agent}: ${message.content}`,
+      message,
+    });
+  }
+  for (const event of listTaskEvents({ ...scope, limit })) {
+    if (event.created_at < since) continue;
+    items.push({
+      source: "task_event",
+      at: event.created_at,
+      id: event.id,
+      summary: `${event.by_agent} ${event.event_type} task #${event.task_id}${event.phase ? ` -> ${event.phase}` : ""}: ${event.message}`,
+      event,
+    });
+  }
+  for (const result of listTestResults({ ...scope, limit })) {
+    if (result.created_at < since) continue;
+    items.push({
+      source: "test_result",
+      at: result.created_at,
+      id: result.id,
+      summary: `${result.by_agent} recorded ${result.status} test${result.task_id ? ` for task #${result.task_id}` : ""}: ${result.command}${result.output_summary ? ` - ${result.output_summary}` : ""}`,
+      test_result: result,
+    });
+  }
+  for (const decision of listDecisions({ ...scope, limit })) {
+    if (decision.created_at < since) continue;
+    items.push({
+      source: "decision",
+      at: decision.created_at,
+      id: decision.id,
+      summary: `${decision.by_agent} decided: ${decision.decision}${decision.rationale ? ` - ${decision.rationale}` : ""}`,
+      decision,
+    });
+  }
+  for (const memory of listMemories({ ...scope, since, limit })) {
+    items.push({
+      source: "memory",
+      at: memory.created_at,
+      id: memory.id,
+      summary: `${memory.by_agent} remembered [${memory.kind}]: ${memory.content}`,
+      memory,
+    });
+  }
+
+  return items
+    .sort((a, b) => a.at - b.at || sourceOrder(a.source) - sourceOrder(b.source) || a.id - b.id)
+    .slice(-limit);
+}
+
+export interface Cockpit {
+  waiting_on: string[];
+  ready: string[];
+  blockers: string[];
+  suggested_next_actions: string[];
+  board: ProjectBoard;
+}
+
+export function cockpit(opts: SessionBriefOptions = {}): Cockpit {
+  const compatibility = legacyCore("cockpit", opts);
+  if (compatibility.handled) return compatibility.value;
+  const board = projectBoard(opts);
+  const waitingOn: string[] = [];
+  const ready: string[] = [];
+  const blockers: string[] = [];
+
+  for (const task of board.waiting_acknowledgement) {
+    waitingOn.push(`task #${task.id} acknowledgement from ${task.pending_assignee ?? task.claimed_by ?? "assignee"}: ${task.title}`);
+  }
+  for (const task of board.waiting_review) {
+    waitingOn.push(`task #${task.id} review: ${task.title}`);
+  }
+  for (const task of board.blocked_tasks) {
+    blockers.push(`task #${task.id} blocked${task.blocked_reason ? `: ${task.blocked_reason}` : ""}`);
+  }
+  for (const task of board.overdue_tasks) {
+    blockers.push(`task #${task.id} overdue: ${task.title}`);
+  }
+  for (const task of board.stale_tasks) {
+    blockers.push(`task #${task.id} stale holder ${task.claimed_by ?? "unknown"}: ${task.title}`);
+  }
+  for (const task of board.checkin_due_tasks) {
+    waitingOn.push(`task #${task.id} check-in due from ${task.claimed_by ?? task.pending_assignee ?? "holder"}: ${task.title}`);
+  }
+  for (const row of board.scope_conflicts) {
+    blockers.push(`task #${row.task_id} edit scope overlaps ${row.conflicts.map((conflict) => `#${conflict.task_id}`).join(", ")}`);
+  }
+  const completedNeedsReview = listTasks({
+    project: opts.project,
+    area: opts.area,
+    team: opts.team,
+    state: "completed",
+    include_terminal: true,
+    manager_reviewed: false,
+    limit: opts.limit ?? 50,
+  });
+  for (const task of completedNeedsReview) {
+    ready.push(`task #${task.id} completed, needs manager review: ${task.title}`);
+  }
+  for (const task of board.open_tasks) {
+    ready.push(`task #${task.id} open: ${task.title}`);
+  }
+
+  const suggested = [...board.suggested_next_actions];
+  if (ready.some((item) => item.includes("completed, needs manager review"))) {
+    suggested.push("Review completed tasks and set manager_reviewed when accepted.");
+  }
+  if (waitingOn.length === 0 && blockers.length === 0 && ready.length === 0) {
+    suggested.push("No immediate manager action; check activity for recent discussion.");
+  }
+
+  return {
+    waiting_on: waitingOn,
+    ready,
+    blockers,
+    suggested_next_actions: suggested,
+    board,
+  };
+}
+
+export interface ScopeTeamSummary {
+  team: string | null;
+  agents_total: number;
+  agents_online: number;
+  active_tasks: number;
+  open_tasks: number;
+  blocked_tasks: number;
+  waiting_review: number;
+  stale_tasks: number;
+  overdue_tasks: number;
+  checkin_due_tasks: number;
+  attention: number;
+}
+
+export interface ScopeProjectSummary {
+  project: string | null;
+  agents_total: number;
+  agents_online: number;
+  active_tasks: number;
+  open_tasks: number;
+  blocked_tasks: number;
+  waiting_review: number;
+  stale_tasks: number;
+  overdue_tasks: number;
+  checkin_due_tasks: number;
+  attention: number;
+  teams: ScopeTeamSummary[];
+}
+
+export interface ScopesResult {
+  generated_at: number;
+  projects: ScopeProjectSummary[];
+  totals: {
+    projects: number;
+    teams: number;
+    agents: number;
+    agents_online: number;
+    active_tasks: number;
+    attention: number;
+  };
+}
+
+/**
+ * Enumerate the distinct project/team scopes present on the bus, with live
+ * counts, by unioning agents, active tasks, and message history. This is the
+ * one capability the multi-project cockpit needs that scope-filtered reads
+ * (directory/cockpit/listTasks) cannot provide: they require a scope, they do
+ * not discover what scopes exist. Pure read; no scope argument by design.
+ */
+export function scopes(): ScopesResult {
+  const compatibility = legacyCore("scopes", {});
+  if (compatibility.handled) return compatibility.value;
+  const agents = directory({ project: PROJECT_WILDCARD, area: AREA_WILDCARD, team: TEAM_WILDCARD });
+  const tasks = listTasks({
+    project: PROJECT_WILDCARD,
+    area: AREA_WILDCARD,
+    team: TEAM_WILDCARD,
+    include_terminal: false,
+    limit: 500,
+  });
+  const messageScopes = getDb()
+    .prepare("SELECT DISTINCT project, team FROM messages")
+    .all() as Array<{ project: string | null; team: string | null }>;
+
+  // Group by project, then team. null project/team are real scopes ("unscoped"
+  // agents, "unteamed" workers) and must still appear; we key the maps with
+  // sentinels so null buckets group correctly without colliding with a literal.
+  const PROJECT_NULL = "__agent_bus_project_null__";
+  const TEAM_NULL = "__agent_bus_team_null__";
+  const pkey = (p: string | null): string => (p === null ? PROJECT_NULL : `p:${p}`);
+  const tkey = (t: string | null): string => (t === null ? TEAM_NULL : `t:${t}`);
+
+  interface ProjectAcc {
+    project: string | null;
+    teams: Map<string, ScopeTeamSummary>;
+  }
+  const projects = new Map<string, ProjectAcc>();
+
+  const ensureProject = (project: string | null): ProjectAcc => {
+    const key = pkey(project);
+    let acc = projects.get(key);
+    if (acc === undefined) {
+      acc = { project, teams: new Map() };
+      projects.set(key, acc);
+    }
+    return acc;
+  };
+  const ensureTeam = (project: string | null, team: string | null): ScopeTeamSummary => {
+    const acc = ensureProject(project);
+    const key = tkey(team);
+    let summary = acc.teams.get(key);
+    if (summary === undefined) {
+      summary = {
+        team,
+        agents_total: 0,
+        agents_online: 0,
+        active_tasks: 0,
+        open_tasks: 0,
+        blocked_tasks: 0,
+        waiting_review: 0,
+        stale_tasks: 0,
+        overdue_tasks: 0,
+        checkin_due_tasks: 0,
+        attention: 0,
+      };
+      acc.teams.set(key, summary);
+    }
+    return summary;
+  };
+
+  // Seed buckets for every scope that appears in message history, so a team
+  // that has only chat (no current agents or active tasks) still shows up.
+  for (const row of messageScopes) ensureTeam(row.project, row.team);
+  const ts = now();
+
+  for (const agent of agents) {
+    const summary = ensureTeam(agent.project, agent.team);
+    summary.agents_total += 1;
+    if (agent.presence === "online") summary.agents_online += 1;
+  }
+
+  for (const task of tasks) {
+    const summary = ensureTeam(task.project, task.team);
+    const isActive = task.state === "claimed" || task.state === "working";
+    const isOpen = task.state === "open";
+    const isBlocked = task.state === "blocked";
+    const isWaitingReview = task.review_required && task.review_state === "pending";
+    const isStale = task.stale === true;
+    const isOverdue = task.deadline_at !== null && task.deadline_at < ts && DEADLINE_ATTENTION_STATES.includes(task.state);
+    const isCheckinDue = task.checkin_at !== null && task.checkin_at < ts && CHECKIN_ATTENTION_STATES.includes(task.state);
+    const isWaitingAck =
+      task.ack_required &&
+      task.acknowledged_at === null &&
+      (task.pending_assignee !== null || task.claimed_by !== null);
+    if (isActive) summary.active_tasks += 1;
+    if (isOpen) summary.open_tasks += 1;
+    if (isBlocked) summary.blocked_tasks += 1;
+    if (isWaitingReview) summary.waiting_review += 1;
+    if (isStale) summary.stale_tasks += 1;
+    if (isOverdue) summary.overdue_tasks += 1;
+    if (isCheckinDue) summary.checkin_due_tasks += 1;
+    // Count attention items the same way the cockpit board does: one point per
+    // condition, so the rail badge matches the rows shown in the Attention view
+    // (a single task can be both stale and pending-review). Scope conflicts are
+    // the one board attention source not counted here — computing them needs a
+    // cross-task check per task, too costly for this discovery-level summary.
+    summary.attention +=
+      (isBlocked ? 1 : 0) + (isWaitingReview ? 1 : 0) + (isStale ? 1 : 0) + (isWaitingAck ? 1 : 0) + (isOverdue ? 1 : 0) + (isCheckinDue ? 1 : 0);
+  }
+
+  const projectSummaries: ScopeProjectSummary[] = [];
+  let totalTeams = 0;
+  for (const acc of projects.values()) {
+    const teams = [...acc.teams.values()].sort(compareScopeBuckets);
+    totalTeams += teams.length;
+    const rollup = teams.reduce(
+      (sum, team) => ({
+        agents_total: sum.agents_total + team.agents_total,
+        agents_online: sum.agents_online + team.agents_online,
+        active_tasks: sum.active_tasks + team.active_tasks,
+        open_tasks: sum.open_tasks + team.open_tasks,
+        blocked_tasks: sum.blocked_tasks + team.blocked_tasks,
+        waiting_review: sum.waiting_review + team.waiting_review,
+        stale_tasks: sum.stale_tasks + team.stale_tasks,
+        overdue_tasks: sum.overdue_tasks + team.overdue_tasks,
+        checkin_due_tasks: sum.checkin_due_tasks + team.checkin_due_tasks,
+        attention: sum.attention + team.attention,
+      }),
+      {
+        agents_total: 0,
+        agents_online: 0,
+        active_tasks: 0,
+        open_tasks: 0,
+        blocked_tasks: 0,
+        waiting_review: 0,
+        stale_tasks: 0,
+        overdue_tasks: 0,
+        checkin_due_tasks: 0,
+        attention: 0,
+      },
+    );
+    projectSummaries.push({ project: acc.project, ...rollup, teams });
+  }
+  projectSummaries.sort(compareScopeBuckets);
+
+  return {
+    generated_at: now(),
+    projects: projectSummaries,
+    totals: {
+      projects: projectSummaries.length,
+      teams: totalTeams,
+      agents: agents.length,
+      agents_online: agents.filter((agent) => agent.presence === "online").length,
+      active_tasks: projectSummaries.reduce((sum, project) => sum + project.active_tasks, 0),
+      attention: projectSummaries.reduce((sum, project) => sum + project.attention, 0),
+    },
+  };
+}
+
+/**
+ * Sort scope buckets so the ones a human should look at first float up:
+ * attention desc, then online agents desc, then active tasks desc, then name
+ * (named scopes before the null "unscoped"/"unteamed" bucket).
+ */
+interface ScopeBucketOrder {
+  attention: number;
+  agents_online: number;
+  active_tasks: number;
+  project?: string | null;
+  team?: string | null;
+}
+
+function compareScopeBuckets(a: ScopeBucketOrder, b: ScopeBucketOrder): number {
+  if (a.attention !== b.attention) return b.attention - a.attention;
+  if (a.agents_online !== b.agents_online) return b.agents_online - a.agents_online;
+  if (a.active_tasks !== b.active_tasks) return b.active_tasks - a.active_tasks;
+  const an = a.project !== undefined ? a.project : a.team ?? null;
+  const bn = b.project !== undefined ? b.project : b.team ?? null;
+  if (an === null) return bn === null ? 0 : 1;
+  if (bn === null) return -1;
+  return an.localeCompare(bn);
+}
+
+export interface TimeseriesOptions {
+  project?: string;
+  area?: string;
+  team?: string;
+  window_ms?: number;
+  buckets?: number;
+  days?: number;
+  now_ms?: number;
+}
+
+export interface TimeseriesResult {
+  now: number;
+  window_ms: number;
+  bucket_ms: number;
+  buckets: Array<{ from: number; to: number }>;
+  messages: number[];
+  task_events: number[];
+  activity: number[];
+  totals: { messages: number; task_events: number };
+  deltas: { messages_pct: number; task_events_pct: number };
+  daily: { days: number; day_ms: number; tasks_created: number[]; from: number[] };
+}
+
+function scopedTimestamps(
+  table: "messages" | "task_events" | "tasks",
+  scope: { project?: string; area?: string; team?: string },
+  sinceMs: number,
+): number[] {
+  const where: string[] = ["created_at >= ?"];
+  const params: unknown[] = [sinceMs];
+  if (scope.project !== undefined && scope.project !== PROJECT_WILDCARD) {
+    validateProject(scope.project);
+    where.push("(project = ? OR project IS NULL)");
+    params.push(scope.project);
+  }
+  if (scope.area !== undefined && scope.area !== AREA_WILDCARD) {
+    validateArea(scope.area);
+    where.push("(area = ? OR area IS NULL)");
+    params.push(scope.area);
+  }
+  if (scope.team !== undefined && scope.team !== TEAM_WILDCARD) {
+    validateTeam(scope.team);
+    where.push("team = ?");
+    params.push(scope.team);
+  }
+  // `table` is a fixed literal union, never user input — safe to interpolate.
+  const rows = getDb()
+    .prepare(`SELECT created_at FROM ${table} WHERE ${where.join(" AND ")}`)
+    .all(...params) as Array<{ created_at: number }>;
+  return rows.map((r) => r.created_at);
+}
+
+/**
+ * Real time-series for the cockpit charts: message and task-event volume
+ * bucketed over a rolling window, plus a daily tasks-created cadence and
+ * percentage deltas versus the previous equal window. Pure read over existing
+ * tables — no new columns, no stored aggregates. now_ms is injectable for tests.
+ */
+export function timeseries(opts: TimeseriesOptions = {}): TimeseriesResult {
+  const compatibility = legacyCore("timeseries", opts);
+  if (compatibility.handled) return compatibility.value;
+  const nowMs = opts.now_ms ?? now();
+  const buckets = Math.min(Math.max(opts.buckets ?? 24, 1), 168);
+  const windowMs = Math.min(Math.max(opts.window_ms ?? 24 * 3600 * 1000, buckets), 31 * 24 * 3600 * 1000);
+  const bucketMs = Math.max(1, Math.floor(windowMs / buckets));
+  const span = bucketMs * buckets;
+  const start = nowMs - span;
+  const prevStart = start - span;
+  const scope = { project: opts.project, area: opts.area, team: opts.team };
+
+  const msgTimes = scopedTimestamps("messages", scope, prevStart);
+  const evtTimes = scopedTimestamps("task_events", scope, prevStart);
+
+  const bucketize = (times: number[]): number[] => {
+    const arr: number[] = new Array(buckets).fill(0);
+    for (const t of times) {
+      if (t < start || t > nowMs) continue;
+      let i = Math.floor((t - start) / bucketMs);
+      if (i >= buckets) i = buckets - 1;
+      if (i < 0) i = 0;
+      arr[i] = (arr[i] ?? 0) + 1;
+    }
+    return arr;
+  };
+  const inRange = (times: number[], lo: number, hi: number): number =>
+    times.reduce((n, t) => n + (t >= lo && t < hi ? 1 : 0), 0);
+  const pct = (cur: number, prev: number): number =>
+    prev === 0 ? (cur === 0 ? 0 : 100) : Math.round(((cur - prev) / prev) * 100);
+
+  const messages = bucketize(msgTimes);
+  const taskEvents = bucketize(evtTimes);
+  const activity = messages.map((m, i) => m + (taskEvents[i] ?? 0));
+  const bucketRanges = Array.from({ length: buckets }, (_, i) => ({
+    from: start + i * bucketMs,
+    to: start + (i + 1) * bucketMs,
+  }));
+  const curMsg = inRange(msgTimes, start, nowMs + 1);
+  const prevMsg = inRange(msgTimes, prevStart, start);
+  const curEvt = inRange(evtTimes, start, nowMs + 1);
+  const prevEvt = inRange(evtTimes, prevStart, start);
+
+  const days = Math.min(Math.max(opts.days ?? 7, 1), 31);
+  const dayMs = 24 * 3600 * 1000;
+  const dayStart = nowMs - days * dayMs;
+  const taskTimes = scopedTimestamps("tasks", scope, dayStart);
+  const tasksDaily: number[] = new Array(days).fill(0);
+  const dailyFrom = Array.from({ length: days }, (_, i) => dayStart + i * dayMs);
+  for (const t of taskTimes) {
+    if (t < dayStart || t > nowMs) continue;
+    let i = Math.floor((t - dayStart) / dayMs);
+    if (i >= days) i = days - 1;
+    if (i < 0) i = 0;
+    tasksDaily[i] = (tasksDaily[i] ?? 0) + 1;
+  }
+
+  return {
+    now: nowMs,
+    window_ms: span,
+    bucket_ms: bucketMs,
+    buckets: bucketRanges,
+    messages,
+    task_events: taskEvents,
+    activity,
+    totals: { messages: curMsg, task_events: curEvt },
+    deltas: { messages_pct: pct(curMsg, prevMsg), task_events_pct: pct(curEvt, prevEvt) },
+    daily: { days, day_ms: dayMs, tasks_created: tasksDaily, from: dailyFrom },
+  };
+}
+
+export interface AgentNowOptions {
+  agent: string;
+  task_id?: number;
+  phase?: string | null;
+  note?: string | null;
+  status?: AgentStatus;
+}
+
+export interface AgentNowResult {
+  agent: Agent;
+  task: Task | null;
+  event: TaskEvent | null;
+  suggested_next_actions: string[];
+}
+
+export function agentNow(opts: AgentNowOptions): AgentNowResult {
+  const compatibility = legacyCore("now", opts);
+  if (compatibility.handled) return compatibility.value;
+  validateName(opts.agent);
+  const agent = setAgentStatus(opts.agent, opts.status ?? (opts.task_id !== undefined ? "working" : "idle"));
+  let task: Task | null = null;
+  let event: TaskEvent | null = null;
+
+  if (opts.task_id !== undefined) {
+    const current = getTask(opts.task_id);
+    const nextState = current.state === "claimed" || current.state === "blocked" ? "working" : undefined;
+    task = updateTask({
+      agent: opts.agent,
+      task_id: opts.task_id,
+      state: nextState,
+      phase: opts.phase,
+    });
+    if (opts.note !== undefined || opts.phase !== undefined) {
+      event = recordTaskEvent({
+        by_agent: opts.agent,
+        task_id: opts.task_id,
+        event_type: opts.phase !== undefined ? "phase" : "progress",
+        phase: opts.phase,
+        message: opts.note ?? (opts.phase ? `phase -> ${opts.phase}` : "progress update"),
+        metadata: {
+          status: agent.status,
+        },
+      });
+      task = getTask(opts.task_id);
+    }
+  }
+
+  return {
+    agent,
+    task,
+    event,
+    suggested_next_actions: [
+      opts.task_id !== undefined ? `task #${opts.task_id} is visible in activity, cockpit, and task_result` : `agent ${opts.agent} status updated`,
+      "Tell the user what changed and continue local work.",
+    ],
+  };
+}
+
+function sourceOrder(source: ActivityItem["source"]): number {
+  switch (source) {
+    case "message":
+      return 0;
+    case "task_event":
+      return 1;
+    case "test_result":
+      return 2;
+    case "decision":
+      return 3;
+    case "memory":
+      return 4;
+  }
+}
+
+export interface FinalReport {
+  implemented: string[];
+  not_implemented: string[];
+  known_risks: string[];
+  tests_passed: string[];
+  test_results: TestResult[];
+  manual_tests_needed: string[];
+  warnings: string[];
+  safe_to_commit: boolean;
+  safe_to_push: boolean;
+  safe_to_deploy: false;
+}
+
+export interface ReviewGateReport {
+  ok: boolean;
+  blockers: string[];
+  warnings: string[];
+  final_report: FinalReport;
+  board: ProjectBoard;
+}
+
+export function finalReport(opts: ListTasksOptions = {}): FinalReport {
+  const compatibility = legacyCore("final_report", opts);
+  if (compatibility.handled) return compatibility.value;
+  const tasks = listTasks({ ...opts, include_terminal: true, limit: opts.limit ?? 500 });
+  const testResults = listTestResults({ project: opts.project, area: opts.area, team: opts.team, limit: 100 });
+  const implemented = tasks
+    .filter((task) => task.state === "completed")
+    .map((task) => task.title);
+  const notImplemented = tasks
+    .filter((task) => task.state !== "backlog" && task.state !== "completed" && task.state !== "canceled")
+    .map((task) => task.title);
+  const knownRisks = tasks
+    .filter((task) => task.blocked_reason !== null || task.state === "failed" || task.stale === true)
+    .map((task) => `#${task.id} ${task.title}${task.blocked_reason ? `: ${task.blocked_reason}` : ""}`);
+  const testsPassed = tasks
+    .filter((task) => task.mode === "test_only" && task.state === "completed")
+    .map((task) => task.final_answer ?? task.result ?? task.title);
+  for (const result of testResults.filter((row) => row.status === "passed")) {
+    testsPassed.push(`${result.command}${result.output_summary ? ` - ${result.output_summary}` : ""}${result.git_ref ? ` @${result.git_ref}` : ""}${result.cwd ? ` cwd=${result.cwd}` : ""}`);
+  }
+  const manualTestsNeeded = tasks
+    .filter((task) => task.state !== "backlog" && (task.state !== "completed" || task.manager_reviewed === false || (task.review_required && task.review_state !== "approved")))
+    .map((task) => task.title);
+  const warnings = finalReportWarnings(opts, tasks);
+  const safe = notImplemented.length === 0 && knownRisks.length === 0 && manualTestsNeeded.length === 0;
+  return {
+    implemented,
+    not_implemented: notImplemented,
+    known_risks: knownRisks,
+    tests_passed: testsPassed,
+    test_results: testResults,
+    manual_tests_needed: manualTestsNeeded,
+    warnings,
+    safe_to_commit: safe,
+    safe_to_push: safe,
+    safe_to_deploy: false,
+  };
+}
+
+function finalReportWarnings(opts: ListTasksOptions, tasks: Task[]): string[] {
+  const implementationTasks = tasks.filter((task) =>
+    task.state === "completed" &&
+    (task.mode === "edit_files" || task.mode === "propose_patch")
+  );
+  if (implementationTasks.length < 2) return [];
+  const decisions = listDecisions({ project: opts.project, area: opts.area, team: opts.team, limit: 1 });
+  const memories = listMemories({ project: opts.project, area: opts.area, team: opts.team, limit: 1 });
+  if (decisions.length > 0 || memories.length > 0) return [];
+  return [
+    `${implementationTasks.length} completed implementation/proposal task(s), but no decisions or memories exist in this scope; briefs may lack reusable context. Record decisions, lessons, risks, or handoff notes when they are transferable.`,
+  ];
+}
+
+export function reviewGate(opts: ListTasksOptions = {}): ReviewGateReport {
+  const compatibility = legacyCore("review_gate", opts);
+  if (compatibility.handled) return compatibility.value;
+  const board = projectBoard(opts);
+  const report = finalReport(opts);
+  const blockers: string[] = [];
+  const warnings: string[] = [];
+  if (board.active_tasks.length > 0) blockers.push(`${board.active_tasks.length} active task(s) still running`);
+  if (board.blocked_tasks.length > 0) blockers.push(`${board.blocked_tasks.length} blocked task(s)`);
+  if (board.waiting_review.length > 0) blockers.push(`${board.waiting_review.length} task(s) waiting for review`);
+  if (board.waiting_acknowledgement.length > 0) warnings.push(`${board.waiting_acknowledgement.length} task(s) waiting for acknowledgement`);
+  if (board.overdue_tasks.length > 0) blockers.push(`${board.overdue_tasks.length} overdue task(s)`);
+  if (board.checkin_due_tasks.length > 0) warnings.push(`${board.checkin_due_tasks.length} task(s) due for check-in`);
+  if (board.stale_tasks.length > 0) warnings.push(`${board.stale_tasks.length} stale task holder(s)`);
+  if (board.scope_conflicts.length > 0) blockers.push(`${board.scope_conflicts.length} edit scope conflict(s)`);
+  warnings.push(...report.warnings);
+  if (!report.safe_to_commit) blockers.push("final_report says safe_to_commit=false");
+  if (!report.safe_to_push) blockers.push("final_report says safe_to_push=false");
+  return {
+    ok: blockers.length === 0,
+    blockers,
+    warnings,
+    final_report: report,
+    board,
+  };
+}
