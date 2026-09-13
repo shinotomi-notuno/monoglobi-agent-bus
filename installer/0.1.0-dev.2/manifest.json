@@ -1,6 +1,6 @@
 {
   "version": "0.1.0-dev.2",
-  "source_commit": "6ae5763f49797fdd7996590347f2ee79881fbb69",
+  "source_commit": "d6a40e9e77d69ea12f6dd64b9c88eb1a7901f95a",
   "asset_base": "https://github.com/shinotomi-notuno/monoglobi-agent-bus/releases/download/v0.1.0-dev.2",
   "root_lock_sha256": "9bae5beac639d9c263e1b8f39b7b3b30a805709b6809ba3c27ab1746b468789c",
   "assets": {
